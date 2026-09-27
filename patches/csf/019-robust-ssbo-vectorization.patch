@@ -1,0 +1,1177 @@
+--- a/src/compiler/nir/meson.build
++++ b/src/compiler/nir/meson.build
+@@ -283,6 +283,7 @@
+   'nir_opt_licm.c',
+   'nir_opt_load_skip_helpers.c',
+   'nir_opt_load_store_vectorize.c',
++  'nir_opt_vectorize_robust_ssbo_loads.c',
+   'nir_opt_loop.c',
+   'nir_opt_loop_unroll.c',
+   'nir_opt_memcpy.c',
+@@ -445,6 +446,7 @@
+           'tests/format_convert_tests.cpp',
+           'tests/fp_class_tests.cpp',
+           'tests/load_store_vectorizer_tests.cpp',
++          'tests/robust_ssbo_loads_tests.cpp',
+           'tests/loop_analyze_tests.cpp',
+           'tests/loop_unroll_tests.cpp',
+           'tests/lower_alu_width_tests.cpp',
+--- a/src/compiler/nir/nir.h
++++ b/src/compiler/nir/nir.h
+@@ -5986,6 +5986,7 @@
+ } nir_load_store_vectorize_options;
+ 
+ bool nir_opt_load_store_vectorize(nir_shader *shader, const nir_load_store_vectorize_options *options);
++bool nir_opt_vectorize_robust_ssbo_loads(nir_shader *shader);
+ bool nir_opt_load_store_update_alignments(nir_shader *shader);
+ 
+ typedef bool (*nir_lower_shader_calls_should_remat_func)(nir_instr *instr, void *data);
+--- a/src/compiler/nir/nir_opt_vectorize_robust_ssbo_loads.c
++++ b/src/compiler/nir/nir_opt_vectorize_robust_ssbo_loads.c
+@@ -0,0 +1,395 @@
++#include "nir.h"
++#include "nir_builder.h"
++
++#include "util/u_dynarray.h"
++
++struct robust_ssbo_load {
++   nir_intrinsic_instr *instr;
++   nir_def *resource;
++   nir_def *base;
++   uint32_t offset;
++   uint32_t scale;
++   bool handled;
++};
++
++static bool
++parse_offset_scaled(nir_def *offset, uint32_t scale, nir_def **base,
++                    uint32_t *add, uint32_t *out_scale);
++
++static bool
++const_u32(nir_def *def, uint32_t *value)
++{
++   nir_const_value *constant = nir_src_as_const_value(nir_src_for_ssa(def));
++   if (!constant || def->bit_size != 32 || def->num_components != 1)
++      return false;
++
++   *value = constant->u32;
++   return true;
++}
++
++static bool
++const_src_u32(const nir_alu_src *src, uint32_t *value)
++{
++   if (src->swizzle[0] != 0 || !src->src.ssa ||
++       src->src.ssa->num_components != 1)
++      return false;
++
++   return const_u32(src->src.ssa, value);
++}
++
++static bool
++parse_offset_src(const nir_alu_src *src, uint32_t scale, nir_def **base,
++                 uint32_t *add, uint32_t *out_scale)
++{
++   if (src->swizzle[0] != 0 || !src->src.ssa ||
++       src->src.ssa->num_components != 1)
++      return false;
++
++   return parse_offset_scaled(src->src.ssa, scale, base, add, out_scale);
++}
++
++static bool
++parse_offset_scaled(nir_def *offset, uint32_t scale, nir_def **base,
++                    uint32_t *add, uint32_t *out_scale)
++{
++   uint32_t constant;
++   if (const_u32(offset, &constant)) {
++      *base = NULL;
++      *add = constant * scale;
++      *out_scale = scale;
++      return true;
++   }
++
++   if (offset->bit_size != 32 || offset->num_components != 1 ||
++       !nir_def_is_alu(offset)) {
++      *base = offset;
++      *add = 0;
++      *out_scale = scale;
++      return offset->bit_size == 32 && offset->num_components == 1;
++   }
++
++   nir_alu_instr *alu = nir_def_as_alu(offset);
++   uint32_t c0, c1;
++   switch (alu->op) {
++   case nir_op_iadd:
++      if (const_src_u32(&alu->src[0], &c0) &&
++          !const_src_u32(&alu->src[1], &c1) &&
++          parse_offset_src(&alu->src[1], scale, base, add, out_scale)) {
++         *add += c0 * scale;
++         return true;
++      }
++      if (const_src_u32(&alu->src[1], &c1) &&
++          !const_src_u32(&alu->src[0], &c0) &&
++          parse_offset_src(&alu->src[0], scale, base, add, out_scale)) {
++         *add += c1 * scale;
++         return true;
++      }
++      if (const_src_u32(&alu->src[0], &c0) &&
++          const_src_u32(&alu->src[1], &c1)) {
++         *base = NULL;
++         *add = (c0 + c1) * scale;
++         *out_scale = scale;
++         return true;
++      }
++      break;
++
++   case nir_op_imul:
++      if (const_src_u32(&alu->src[0], &c0) &&
++          !const_src_u32(&alu->src[1], &c1))
++         return parse_offset_src(&alu->src[1], scale * c0, base, add,
++                                 out_scale);
++      if (const_src_u32(&alu->src[1], &c1) &&
++          !const_src_u32(&alu->src[0], &c0))
++         return parse_offset_src(&alu->src[0], scale * c1, base, add,
++                                 out_scale);
++      break;
++
++   case nir_op_ishl:
++      if (const_src_u32(&alu->src[1], &c1) &&
++          !const_src_u32(&alu->src[0], &c0) && c1 < 32)
++         return parse_offset_src(&alu->src[0], scale << c1, base, add,
++                                 out_scale);
++      break;
++
++   default:
++      break;
++   }
++
++   *base = offset;
++   *add = 0;
++   *out_scale = scale;
++   return true;
++}
++
++static bool
++parse_offset(nir_def *offset, nir_def **base, uint32_t *add,
++             uint32_t *scale)
++{
++   return parse_offset_scaled(offset, 1, base, add, scale);
++}
++
++static bool
++has_unsafe_memory(nir_shader *shader)
++{
++   nir_foreach_function_impl(impl, shader) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            if (nir_intrinsic_writes_external_memory(intr) ||
++                intr->intrinsic == nir_intrinsic_barrier)
++               return true;
++         }
++      }
++   }
++
++   return false;
++}
++
++static bool
++is_eligible(const struct robust_ssbo_load *load)
++{
++   nir_intrinsic_instr *instr = load->instr;
++   if (instr->intrinsic != nir_intrinsic_load_ssbo ||
++       instr->def.bit_size != 32 || instr->def.num_components != 1 ||
++       nir_intrinsic_offset_shift(instr) != 0 ||
++       nir_intrinsic_align(instr) < 4 ||
++       (load->scale != 1 && load->scale != 4))
++      return false;
++
++   enum gl_access_qualifier access = nir_intrinsic_access(instr);
++   return (access & (ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER)) ==
++             (ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER) &&
++          !(access & (ACCESS_VOLATILE | ACCESS_COHERENT | ACCESS_ATOMIC |
++                      ACCESS_KEEP_SCALAR));
++}
++
++static bool
++same_group(const struct robust_ssbo_load *a, const struct robust_ssbo_load *b)
++{
++   return a->instr->instr.block == b->instr->instr.block &&
++          a->resource == b->resource && a->base == b->base &&
++          a->scale == b->scale &&
++          nir_intrinsic_access(a->instr) == nir_intrinsic_access(b->instr);
++}
++
++static bool
++def_dominates_instr(nir_def *def, nir_instr *instr)
++{
++   nir_instr *def_instr = nir_def_instr(def);
++   if (!nir_block_dominates(def_instr->block, instr->block))
++      return false;
++   return def_instr->block != instr->block ||
++          def_instr == instr || nir_instr_is_before(def_instr, instr);
++}
++
++static bool
++find_group(struct robust_ssbo_load *loads, unsigned count,
++           struct robust_ssbo_load *group[4], unsigned *group_count)
++{
++   for (unsigned i = 0; i < count; i++) {
++      if (loads[i].handled || !is_eligible(&loads[i]))
++         continue;
++
++      if (loads[i].offset >= 4) {
++         bool has_previous = false;
++         for (unsigned j = 0; j < count; j++) {
++            if (!loads[j].handled && is_eligible(&loads[j]) &&
++                same_group(&loads[i], &loads[j]) &&
++                loads[j].offset == loads[i].offset - 4) {
++               has_previous = true;
++               break;
++            }
++         }
++         if (has_previous)
++            continue;
++      }
++
++      unsigned best = 0;
++      struct robust_ssbo_load *candidate[4] = { NULL };
++      for (unsigned n = 2; n <= 4; n++) {
++         if (loads[i].offset > UINT32_MAX - 4 * (n - 1))
++            break;
++
++         bool found_all = true;
++         for (unsigned c = 0; c < n; c++) {
++            candidate[c] = NULL;
++            uint32_t wanted = loads[i].offset + 4 * c;
++            for (unsigned j = 0; j < count; j++) {
++               if (!loads[j].handled && is_eligible(&loads[j]) &&
++                   same_group(&loads[i], &loads[j]) &&
++                   loads[j].offset == wanted) {
++                  candidate[c] = &loads[j];
++                  break;
++               }
++            }
++            if (!candidate[c]) {
++               found_all = false;
++               break;
++            }
++         }
++
++         if (!found_all)
++            break;
++         best = n;
++         for (unsigned c = 0; c < n; c++)
++            group[c] = candidate[c];
++      }
++
++      if (best) {
++         *group_count = best;
++         return true;
++      }
++   }
++
++   return false;
++}
++
++static bool
++transform_group(nir_shader *shader, struct robust_ssbo_load *group[4],
++                unsigned count)
++{
++   struct robust_ssbo_load *first = group[0];
++   nir_intrinsic_instr *earliest = first->instr;
++   for (unsigned i = 1; i < count; i++) {
++      if (nir_instr_is_before(&group[i]->instr->instr, &earliest->instr))
++         earliest = group[i]->instr;
++   }
++
++   if ((first->base && !def_dominates_instr(first->base, &earliest->instr)) ||
++       !def_dominates_instr(first->resource, &earliest->instr))
++      return false;
++
++   nir_builder b = nir_builder_create(nir_cf_node_get_function(&earliest->instr.block->cf_node));
++   b.cursor = nir_before_instr(&earliest->instr);
++
++   nir_def *low = first->base;
++   if (!low)
++      low = nir_imm_int(&b, first->offset);
++   else {
++      if (first->scale != 1)
++         low = nir_imul_imm(&b, low, first->scale);
++      if (first->offset)
++         low = nir_iadd_imm(&b, low, first->offset);
++   }
++
++   unsigned bytes = 4 * count;
++   nir_def *size = nir_get_ssbo_size(&b, 32, first->resource,
++                                     .access = nir_intrinsic_access(first->instr));
++   nir_def *size_minus_bytes = nir_iadd_imm(&b, size, -bytes);
++   nir_def *valid = nir_iand(&b, nir_uge_imm(&b, size, bytes),
++                             nir_uge(&b, size_minus_bytes, low));
++   nir_if *if_stmt = nir_push_if(&b, valid);
++   nir_def *wide = nir_load_ssbo(&b, count, 32, first->resource, low,
++                                 .access = nir_intrinsic_access(first->instr),
++                                 .align_mul = 4, .align_offset = 0,
++                                 .offset_shift = 0);
++   nir_def *wide_channels[4];
++   for (unsigned i = 0; i < count; i++)
++      wide_channels[i] = nir_channel(&b, wide, i);
++
++   nir_push_else(&b, if_stmt);
++   nir_def *scalar[4];
++   for (unsigned i = 0; i < count; i++) {
++      nir_intrinsic_instr *clone = nir_instr_as_intrinsic(
++         nir_instr_clone(shader, &group[i]->instr->instr));
++      nir_def *offset = group[i]->base;
++      if (!offset)
++         offset = nir_imm_int(&b, group[i]->offset);
++      else {
++         if (group[i]->scale != 1)
++            offset = nir_imul_imm(&b, offset, group[i]->scale);
++         if (group[i]->offset)
++            offset = nir_iadd_imm(&b, offset, group[i]->offset);
++      }
++      clone->src[1] = nir_src_for_ssa(offset);
++      nir_builder_instr_insert(&b, &clone->instr);
++      scalar[i] = &clone->def;
++   }
++   nir_pop_if(&b, NULL);
++
++   for (unsigned i = 0; i < count; i++) {
++      nir_def *value = nir_if_phi(&b, wide_channels[i], scalar[i]);
++      nir_def_rewrite_uses(&group[i]->instr->def, value);
++      nir_instr_remove(&group[i]->instr->instr);
++      group[i]->handled = true;
++   }
++
++   return true;
++}
++
++bool
++nir_opt_vectorize_robust_ssbo_loads(nir_shader *shader)
++{
++   if (shader->info.stage != MESA_SHADER_FRAGMENT || has_unsafe_memory(shader))
++      return false;
++
++   bool progress = false;
++   nir_foreach_function_impl(impl, shader) {
++      nir_metadata_require(impl, nir_metadata_dominance);
++      struct util_dynarray candidates;
++      util_dynarray_init(&candidates, shader);
++
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            if (intr->intrinsic != nir_intrinsic_load_ssbo ||
++                intr->def.bit_size != 32 || intr->def.num_components != 1)
++               continue;
++            if (!block->cf_node.parent ||
++                block->cf_node.parent->type != nir_cf_node_function)
++               continue;
++
++            nir_def *base;
++            uint32_t offset, scale;
++            if (!parse_offset(intr->src[1].ssa, &base, &offset, &scale))
++               continue;
++
++            struct robust_ssbo_load *load = util_dynarray_grow(
++               &candidates, struct robust_ssbo_load, 1);
++            *load = (struct robust_ssbo_load){
++               .instr = intr,
++               .resource = intr->src[0].ssa,
++               .base = base,
++               .offset = offset,
++               .scale = scale,
++            };
++         }
++      }
++
++      struct robust_ssbo_load *loads = util_dynarray_begin(&candidates);
++      unsigned count = util_dynarray_num_elements(&candidates,
++                                                  struct robust_ssbo_load);
++      struct robust_ssbo_load *group[4];
++      unsigned group_count;
++      while (find_group(loads, count, group, &group_count)) {
++         if (transform_group(shader, group, group_count)) {
++            progress = true;
++            nir_metadata_invalidate(shader);
++            nir_metadata_require(impl, nir_metadata_dominance);
++         } else {
++            for (unsigned i = 0; i < group_count; i++)
++               group[i]->handled = true;
++         }
++
++         for (unsigned i = 0; i < count; i++) {
++            if (loads[i].handled)
++               continue;
++            loads[i].resource = loads[i].instr->src[0].ssa;
++            if (!parse_offset(loads[i].instr->src[1].ssa, &loads[i].base,
++                              &loads[i].offset, &loads[i].scale))
++               loads[i].handled = true;
++         }
++      }
++      util_dynarray_fini(&candidates);
++   }
++
++   if (progress)
++      nir_metadata_invalidate(shader);
++   return progress;
++}
+--- a/src/compiler/nir/tests/robust_ssbo_loads_tests.cpp
++++ b/src/compiler/nir/tests/robust_ssbo_loads_tests.cpp
+@@ -0,0 +1,719 @@
++#include "nir_test.h"
++
++namespace {
++
++class nir_opt_vectorize_robust_ssbo_loads_test : public nir_test {
++protected:
++   nir_opt_vectorize_robust_ssbo_loads_test()
++      : nir_test::nir_test("nir_opt_vectorize_robust_ssbo_loads_test",
++                           MESA_SHADER_FRAGMENT)
++   {
++   }
++
++   nir_def *resource(unsigned binding = 0)
++   {
++      nir_intrinsic_instr *index = nir_intrinsic_instr_create(
++         b->shader, nir_intrinsic_vulkan_resource_index);
++      nir_def_init(&index->instr, &index->def, 1, 32);
++      index->num_components = 1;
++      index->src[0] = nir_src_for_ssa(nir_imm_int(b, 0));
++      nir_intrinsic_set_desc_type(index, nir_descriptor_type_storage_buffer);
++      nir_intrinsic_set_desc_set(index, 0);
++      nir_intrinsic_set_binding(index, binding);
++      nir_builder_instr_insert(b, &index->instr);
++      return &index->def;
++   }
++
++   nir_intrinsic_instr *load(nir_def *res, nir_def *offset,
++                             unsigned access = ACCESS_NON_WRITEABLE |
++                                                ACCESS_CAN_REORDER,
++                             unsigned align = 4)
++   {
++      nir_intrinsic_instr *instr = nir_intrinsic_instr_create(
++         b->shader, nir_intrinsic_load_ssbo);
++      nir_def_init(&instr->instr, &instr->def, 1, 32);
++      instr->num_components = 1;
++      instr->src[0] = nir_src_for_ssa(res);
++      instr->src[1] = nir_src_for_ssa(offset);
++      nir_intrinsic_set_access(instr, (gl_access_qualifier)access);
++      nir_intrinsic_set_align(instr, align, 0);
++      nir_intrinsic_set_offset_shift(instr, 0);
++      nir_builder_instr_insert(b, &instr->instr);
++      return instr;
++   }
++
++   void store(nir_def *res, nir_def *offset)
++   {
++      nir_intrinsic_instr *instr = nir_intrinsic_instr_create(
++         b->shader, nir_intrinsic_store_ssbo);
++      instr->num_components = 1;
++      instr->src[0] = nir_src_for_ssa(nir_imm_int(b, 0));
++      instr->src[1] = nir_src_for_ssa(res);
++      instr->src[2] = nir_src_for_ssa(offset);
++      nir_intrinsic_set_write_mask(instr, 1);
++      nir_intrinsic_set_align(instr, 4, 0);
++      nir_intrinsic_set_offset_shift(instr, 0);
++      nir_builder_instr_insert(b, &instr->instr);
++   }
++
++   void barrier()
++   {
++      nir_intrinsic_instr *instr = nir_intrinsic_instr_create(
++         b->shader, nir_intrinsic_barrier);
++      nir_builder_instr_insert(b, &instr->instr);
++   }
++
++   nir_def *swizzled_add(nir_def *vector)
++   {
++      nir_alu_instr *instr = nir_alu_instr_create(b->shader, nir_op_iadd);
++      instr->src[0].src = nir_src_for_ssa(vector);
++      instr->src[0].swizzle[0] = 1;
++      instr->src[1].src = nir_src_for_ssa(nir_imm_int(b, 0));
++      nir_def_init(&instr->instr, &instr->def, 1, 32);
++      nir_builder_instr_insert(b, &instr->instr);
++      return &instr->def;
++   }
++
++   unsigned count(nir_intrinsic_op op)
++   {
++      unsigned result = 0;
++      nir_foreach_block(block, b->impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type == nir_instr_type_intrinsic &&
++                nir_instr_as_intrinsic(instr)->intrinsic == op)
++               result++;
++         }
++      }
++      return result;
++   }
++
++   unsigned count_load_components(unsigned components)
++   {
++      unsigned result = 0;
++      nir_foreach_block(block, b->impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            if (intr->intrinsic == nir_intrinsic_load_ssbo &&
++                intr->num_components == components)
++               result++;
++         }
++      }
++      return result;
++   }
++
++   static unsigned count_shader_loads(nir_shader *shader, unsigned components)
++   {
++      unsigned result = 0;
++      nir_foreach_function_impl(impl, shader) {
++         nir_foreach_block(block, impl) {
++            nir_foreach_instr(instr, block) {
++               if (instr->type != nir_instr_type_intrinsic)
++                  continue;
++               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++               if (intr->intrinsic == nir_intrinsic_load_ssbo &&
++                   intr->num_components == components)
++                  result++;
++            }
++         }
++      }
++      return result;
++   }
++
++   static unsigned count_shader_loads_at(nir_shader *shader, unsigned components,
++                                         uint32_t offset)
++   {
++      unsigned result = 0;
++      nir_foreach_function_impl(impl, shader) {
++         nir_foreach_block(block, impl) {
++            nir_foreach_instr(instr, block) {
++               if (instr->type != nir_instr_type_intrinsic)
++                  continue;
++               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++               if (intr->intrinsic != nir_intrinsic_load_ssbo ||
++                   intr->num_components != components ||
++                   nir_src_as_const_value(intr->src[1]) == nullptr)
++                  continue;
++               if (nir_src_as_const_value(intr->src[1])->u32 == offset)
++                  result++;
++            }
++         }
++      }
++      return result;
++   }
++
++   static bool vector_lane(nir_def *def, unsigned lane, unsigned components)
++   {
++      nir_instr *instr = nir_def_instr(def);
++      if (instr->type != nir_instr_type_alu)
++         return false;
++
++      nir_alu_instr *mov = nir_instr_as_alu(instr);
++      if (mov->op != nir_op_mov || mov->src[0].swizzle[0] != lane)
++         return false;
++
++      nir_instr *source = nir_def_instr(mov->src[0].src.ssa);
++      if (source->type != nir_instr_type_intrinsic)
++         return false;
++      nir_intrinsic_instr *load = nir_instr_as_intrinsic(source);
++      return load->intrinsic == nir_intrinsic_load_ssbo &&
++             load->num_components == components;
++   }
++
++   static bool phi_then_vector_lane(nir_def *def, unsigned lane,
++                                    unsigned components)
++   {
++      nir_instr *instr = nir_def_instr(def);
++      if (instr->type != nir_instr_type_phi)
++         return false;
++
++      nir_phi_instr *phi = nir_instr_as_phi(instr);
++      nir_phi_src *then_src = nullptr;
++      nir_foreach_phi_src(src, phi) {
++         then_src = src;
++         break;
++      }
++      return then_src && vector_lane(then_src->src.ssa, lane, components);
++   }
++
++   nir_shader *specialize_size(unsigned size)
++   {
++      nir_shader *shader = nir_shader_clone(NULL, b->shader);
++      nir_function_impl *impl = nir_shader_get_entrypoint(shader);
++      nir_intrinsic_instr *query = nullptr;
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type == nir_instr_type_intrinsic &&
++                nir_instr_as_intrinsic(instr)->intrinsic ==
++                   nir_intrinsic_get_ssbo_size) {
++               query = nir_instr_as_intrinsic(instr);
++               break;
++            }
++         }
++         if (query)
++            break;
++      }
++      if (!query) {
++         ADD_FAILURE();
++         ralloc_free(shader);
++         return nullptr;
++      }
++      nir_builder builder = nir_builder_create(impl);
++      builder.cursor = nir_before_instr(&query->instr);
++      nir_def_replace(&query->def, nir_imm_int(&builder, size));
++      nir_opt_constant_folding(shader);
++      nir_opt_dead_cf(shader);
++      return shader;
++   }
++
++   nir_shader *specialize_all_sizes(unsigned size)
++   {
++      nir_shader *shader = nir_shader_clone(NULL, b->shader);
++      nir_function_impl *impl = nir_shader_get_entrypoint(shader);
++      nir_builder builder = nir_builder_create(impl);
++      bool found = false;
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr_safe(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic ||
++                nir_instr_as_intrinsic(instr)->intrinsic !=
++                   nir_intrinsic_get_ssbo_size)
++               continue;
++            nir_intrinsic_instr *query = nir_instr_as_intrinsic(instr);
++            builder.cursor = nir_before_instr(&query->instr);
++            nir_def_replace(&query->def, nir_imm_int(&builder, size));
++            found = true;
++         }
++      }
++      if (!found) {
++         ADD_FAILURE();
++         ralloc_free(shader);
++         return nullptr;
++      }
++      nir_opt_constant_folding(shader);
++      nir_opt_dead_cf(shader);
++      return shader;
++   }
++
++   nir_shader *specialize_bias_sizes(unsigned extra)
++   {
++      nir_shader *shader = nir_shader_clone(NULL, b->shader);
++      nir_function_impl *impl = nir_shader_get_entrypoint(shader);
++      nir_builder builder = nir_builder_create(impl);
++      unsigned query_index = 0;
++      bool found = false;
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr_safe(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic ||
++                nir_instr_as_intrinsic(instr)->intrinsic !=
++                   nir_intrinsic_get_ssbo_size)
++               continue;
++            nir_intrinsic_instr *query = nir_instr_as_intrinsic(instr);
++            builder.cursor = nir_before_instr(&query->instr);
++            nir_def_replace(&query->def,
++                            nir_imm_int(&builder, query_index * 4 + extra));
++            query_index++;
++            found = true;
++         }
++      }
++      if (!found) {
++         ADD_FAILURE();
++         ralloc_free(shader);
++         return nullptr;
++      }
++      nir_opt_constant_folding(shader);
++      nir_opt_dead_cf(shader);
++      return shader;
++   }
++
++   unsigned count_ifs()
++   {
++      unsigned result = 0;
++      nir_foreach_block(block, b->impl) {
++         if (nir_block_get_following_if(block))
++            result++;
++      }
++      return result;
++   }
++
++   void check_specialized_width(unsigned width)
++   {
++      nir_def *res = resource();
++      nir_def *base = nir_imm_int(b, 64);
++      nir_intrinsic_instr *loads[4];
++      for (unsigned i = 0; i < width; i++)
++         loads[i] = load(res, nir_iadd_imm(b, base, 4 * i));
++
++      switch (width) {
++      case 2:
++         nir_vec2(b, &loads[0]->def, &loads[1]->def);
++         break;
++      case 3:
++         nir_vec3(b, &loads[0]->def, &loads[1]->def, &loads[2]->def);
++         break;
++      case 4:
++         nir_vec4(b, &loads[0]->def, &loads[1]->def, &loads[2]->def,
++                  &loads[3]->def);
++         break;
++      default:
++         ADD_FAILURE();
++         return;
++      }
++
++      ASSERT_TRUE(nir_opt_vectorize_robust_ssbo_loads(b->shader));
++      nir_shader *exact = specialize_size(64 + 4 * width);
++      nir_shader *partial = specialize_size(64 + 4 * (width - 1));
++      nir_shader *empty = specialize_size(0);
++      ASSERT_NE(exact, nullptr);
++      ASSERT_NE(partial, nullptr);
++      ASSERT_NE(empty, nullptr);
++
++      EXPECT_EQ(count_shader_loads(exact, width), 1u);
++      EXPECT_EQ(count_shader_loads_at(exact, width, 64), 1u);
++      EXPECT_EQ(count_shader_loads(partial, width), 0u);
++      EXPECT_EQ(count_shader_loads(partial, 1), width);
++      EXPECT_EQ(count_shader_loads(empty, width), 0u);
++      EXPECT_EQ(count_shader_loads(empty, 1), width);
++      for (unsigned i = 0; i < width; i++) {
++         EXPECT_EQ(count_shader_loads_at(partial, 1, 64 + 4 * i), 1u);
++         EXPECT_EQ(count_shader_loads_at(empty, 1, 64 + 4 * i), 1u);
++      }
++
++      ralloc_free(exact);
++      ralloc_free(partial);
++      ralloc_free(empty);
++   }
++};
++
++TEST_F(nir_opt_vectorize_robust_ssbo_loads_test, guarded_vec2_has_scalar_fallback)
++{
++   nir_def *res = resource();
++   nir_def *base = nir_undef(b, 1, 32);
++   nir_intrinsic_instr *first = load(res, base);
++   nir_intrinsic_instr *second = load(res, nir_iadd_imm(b, base, 4));
++   nir_vec2(b, &first->def, &second->def);
++
++   ASSERT_TRUE(nir_opt_vectorize_robust_ssbo_loads(b->shader));
++   nir_validate_shader(b->shader, NULL);
++   EXPECT_EQ(count(nir_intrinsic_load_ssbo), 3u);
++   EXPECT_EQ(count_load_components(2), 1u);
++   EXPECT_EQ(count_load_components(1), 2u);
++   EXPECT_EQ(count(nir_intrinsic_get_ssbo_size), 1u);
++   EXPECT_EQ(count_ifs(), 1u);
++   EXPECT_FALSE(nir_opt_vectorize_robust_ssbo_loads(b->shader));
++}
++
++TEST_F(nir_opt_vectorize_robust_ssbo_loads_test, exact_and_partial_bounds_keep_scalar_results)
++{
++   nir_def *res = resource();
++   nir_def *base = nir_undef(b, 1, 32);
++   nir_intrinsic_instr *first = load(res, base);
++   nir_intrinsic_instr *second = load(res, nir_iadd_imm(b, base, 4));
++   nir_vec2(b, &first->def, &second->def);
++   nir_get_ssbo_size(b, 32, res);
++
++   ASSERT_TRUE(nir_opt_vectorize_robust_ssbo_loads(b->shader));
++   nir_validate_shader(b->shader, NULL);
++   EXPECT_EQ(count(nir_intrinsic_load_ssbo), 3u);
++   EXPECT_EQ(count_ifs(), 1u);
++}
++
++TEST_F(nir_opt_vectorize_robust_ssbo_loads_test, bounds_select_vector_or_scalar_execution)
++{
++   nir_def *res = resource();
++   nir_def *base = nir_imm_int(b, 64);
++   nir_intrinsic_instr *first = load(res, base);
++   nir_intrinsic_instr *second = load(res, nir_iadd_imm(b, base, 4));
++   nir_def *output = nir_vec2(b, &first->def, &second->def);
++
++   ASSERT_TRUE(nir_opt_vectorize_robust_ssbo_loads(b->shader));
++   nir_alu_instr *output_alu = nir_def_as_alu(output);
++   ASSERT_EQ(output_alu->op, nir_op_vec2);
++   EXPECT_TRUE(phi_then_vector_lane(output_alu->src[0].src.ssa, 0, 2));
++   EXPECT_TRUE(phi_then_vector_lane(output_alu->src[1].src.ssa, 1, 2));
++   nir_shader *exact = specialize_size(72);
++   nir_shader *partial = specialize_size(68);
++   nir_shader *empty = specialize_size(0);
++   ASSERT_NE(exact, nullptr);
++   ASSERT_NE(partial, nullptr);
++   ASSERT_NE(empty, nullptr);
++   EXPECT_EQ(count_shader_loads(exact, 2), 1u);
++   EXPECT_EQ(count_shader_loads(exact, 1), 0u);
++   EXPECT_EQ(count_shader_loads_at(exact, 2, 64), 1u);
++   EXPECT_EQ(count_shader_loads(partial, 2), 0u);
++   EXPECT_EQ(count_shader_loads(partial, 1), 2u);
++   EXPECT_EQ(count_shader_loads_at(partial, 1, 64), 1u);
++   EXPECT_EQ(count_shader_loads_at(partial, 1, 68), 1u);
++   EXPECT_EQ(count_shader_loads(empty, 2), 0u);
++   EXPECT_EQ(count_shader_loads(empty, 1), 2u);
++   EXPECT_EQ(count_shader_loads_at(empty, 1, 64), 1u);
++   EXPECT_EQ(count_shader_loads_at(empty, 1, 68), 1u);
++   ralloc_free(exact);
++   ralloc_free(partial);
++   ralloc_free(empty);
++}
++
++TEST_F(nir_opt_vectorize_robust_ssbo_loads_test, width3_selects_scalar_fallback)
++{
++   check_specialized_width(3);
++}
++
++TEST_F(nir_opt_vectorize_robust_ssbo_loads_test, width4_selects_scalar_fallback)
++{
++   check_specialized_width(4);
++}
++
++TEST_F(nir_opt_vectorize_robust_ssbo_loads_test, rejects_unsafe_access)
++{
++   nir_def *res = resource();
++   nir_def *base = nir_undef(b, 1, 32);
++   load(res, base, ACCESS_VOLATILE | ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
++   load(res, nir_iadd_imm(b, base, 4), ACCESS_VOLATILE | ACCESS_NON_WRITEABLE |
++                                        ACCESS_CAN_REORDER);
++
++   EXPECT_FALSE(nir_opt_vectorize_robust_ssbo_loads(b->shader));
++   EXPECT_EQ(count(nir_intrinsic_load_ssbo), 2u);
++   EXPECT_EQ(count_ifs(), 0u);
++}
++
++TEST_F(nir_opt_vectorize_robust_ssbo_loads_test,
++       rejects_atomic_and_keep_scalar_access)
++{
++   nir_def *base = nir_undef(b, 1, 32);
++   unsigned flags = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER | ACCESS_ATOMIC;
++   nir_def *atomic_res = resource();
++   load(atomic_res, base, flags);
++   load(atomic_res, nir_iadd_imm(b, base, 4), flags);
++
++   flags = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER | ACCESS_KEEP_SCALAR;
++   nir_def *scalar_res = resource();
++   load(scalar_res, base, flags);
++   load(scalar_res, nir_iadd_imm(b, base, 4), flags);
++
++   EXPECT_FALSE(nir_opt_vectorize_robust_ssbo_loads(b->shader));
++   EXPECT_EQ(count(nir_intrinsic_load_ssbo), 4u);
++   EXPECT_EQ(count_ifs(), 0u);
++}
++
++TEST_F(nir_opt_vectorize_robust_ssbo_loads_test, rejects_holes_and_shifted_offsets)
++{
++   nir_def *res = resource();
++   nir_def *base = nir_undef(b, 1, 32);
++   load(res, base);
++   load(res, nir_iadd_imm(b, base, 8));
++
++   EXPECT_FALSE(nir_opt_vectorize_robust_ssbo_loads(b->shader));
++   EXPECT_EQ(count(nir_intrinsic_load_ssbo), 2u);
++}
++
++TEST_F(nir_opt_vectorize_robust_ssbo_loads_test, rejects_shifted_offsets)
++{
++   nir_def *res = resource();
++   nir_def *base = nir_undef(b, 1, 32);
++   nir_intrinsic_instr *first = load(res, base);
++   nir_intrinsic_instr *second = load(res, nir_iadd_imm(b, base, 1));
++   nir_intrinsic_set_offset_shift(first, 1);
++   nir_intrinsic_set_offset_shift(second, 1);
++
++   EXPECT_FALSE(nir_opt_vectorize_robust_ssbo_loads(b->shader));
++   EXPECT_EQ(count(nir_intrinsic_load_ssbo), 2u);
++}
++
++TEST_F(nir_opt_vectorize_robust_ssbo_loads_test,
++       accepts_opaque_scalar_and_unary_offsets)
++{
++   nir_def *res = resource();
++   nir_def *base = nir_undef(b, 1, 32);
++   nir_def *masked = nir_iand(b, base, nir_imm_int(b, ~3u));
++   load(res, masked);
++   load(res, nir_iadd_imm(b, masked, 4));
++
++   nir_def *unary = nir_ineg(b, base);
++   load(res, unary);
++   load(res, nir_iadd_imm(b, unary, 4));
++
++   nir_def *shifted = nir_ushr(b, masked, nir_imm_int(b, 2));
++   load(res, shifted);
++   load(res, nir_iadd_imm(b, shifted, 4));
++
++   ASSERT_TRUE(nir_opt_vectorize_robust_ssbo_loads(b->shader));
++   nir_validate_shader(b->shader, NULL);
++   EXPECT_EQ(count_load_components(2), 3u);
++}
++
++TEST_F(nir_opt_vectorize_robust_ssbo_loads_test,
++       preserves_swizzled_vector_scalar_expression)
++{
++   nir_def *res = resource();
++   nir_def *vector = nir_imm_ivec2(b, 0xdead, 64);
++   nir_def *offset = swizzled_add(vector);
++   load(res, offset);
++   load(res, nir_iadd_imm(b, offset, 4));
++
++   ASSERT_TRUE(nir_opt_vectorize_robust_ssbo_loads(b->shader));
++   nir_validate_shader(b->shader, NULL);
++   EXPECT_EQ(count_load_components(2), 1u);
++   EXPECT_EQ(count_load_components(1), 2u);
++}
++
++TEST_F(nir_opt_vectorize_robust_ssbo_loads_test, reverse_order_vec4)
++{
++   nir_def *res = resource();
++   nir_def *base = nir_undef(b, 1, 32);
++   nir_intrinsic_instr *loads[4];
++   for (unsigned i = 0; i < 4; i++)
++      loads[i] = load(res, nir_iadd_imm(b, base, 4 * (3 - i)));
++
++   nir_vec4(b, &loads[0]->def, &loads[1]->def, &loads[2]->def,
++            &loads[3]->def);
++   ASSERT_TRUE(nir_opt_vectorize_robust_ssbo_loads(b->shader));
++   nir_validate_shader(b->shader, NULL);
++   EXPECT_EQ(count(nir_intrinsic_load_ssbo), 5u);
++   EXPECT_EQ(count_ifs(), 1u);
++}
++
++TEST_F(nir_opt_vectorize_robust_ssbo_loads_test, rejects_different_resources)
++{
++   nir_def *base = nir_undef(b, 1, 32);
++   load(resource(0), base);
++   load(resource(1), nir_iadd_imm(b, base, 4));
++
++   EXPECT_FALSE(nir_opt_vectorize_robust_ssbo_loads(b->shader));
++   EXPECT_EQ(count(nir_intrinsic_load_ssbo), 2u);
++}
++
++TEST_F(nir_opt_vectorize_robust_ssbo_loads_test, rejects_storage_writes_and_barriers)
++{
++   nir_def *res = resource();
++   nir_def *base = nir_undef(b, 1, 32);
++   load(res, base);
++   load(res, nir_iadd_imm(b, base, 4));
++   store(res, nir_iadd_imm(b, base, 8));
++   barrier();
++
++   EXPECT_FALSE(nir_opt_vectorize_robust_ssbo_loads(b->shader));
++   EXPECT_EQ(count(nir_intrinsic_load_ssbo), 2u);
++   EXPECT_EQ(count_ifs(), 0u);
++}
++
++TEST_F(nir_opt_vectorize_robust_ssbo_loads_test, rejects_nested_control_flow)
++{
++   nir_def *res = resource();
++   nir_def *base = nir_undef(b, 1, 32);
++   nir_push_if(b, nir_imm_true(b));
++   load(res, base);
++   load(res, nir_iadd_imm(b, base, 4));
++   nir_pop_if(b, NULL);
++
++   EXPECT_FALSE(nir_opt_vectorize_robust_ssbo_loads(b->shader));
++   EXPECT_EQ(count(nir_intrinsic_load_ssbo), 2u);
++   EXPECT_EQ(count_ifs(), 1u);
++}
++
++TEST_F(nir_opt_vectorize_robust_ssbo_loads_test, refreshes_dependent_offsets)
++{
++   nir_def *res = resource();
++   nir_def *base = nir_undef(b, 1, 32);
++   nir_intrinsic_instr *first[2];
++   first[0] = load(res, base);
++   first[1] = load(res, nir_iadd_imm(b, base, 4));
++   nir_vec2(b, &first[0]->def, &first[1]->def);
++
++   nir_def *dependent_base = &first[0]->def;
++   nir_intrinsic_instr *second[2];
++   second[0] = load(res, nir_iadd_imm(b, dependent_base, 8));
++   second[1] = load(res, nir_iadd_imm(b, dependent_base, 12));
++   nir_vec2(b, &second[0]->def, &second[1]->def);
++
++   ASSERT_TRUE(nir_opt_vectorize_robust_ssbo_loads(b->shader));
++   nir_validate_shader(b->shader, NULL);
++   EXPECT_EQ(count(nir_intrinsic_load_ssbo), 6u);
++   EXPECT_EQ(count_load_components(2), 2u);
++   EXPECT_EQ(count_load_components(1), 4u);
++   EXPECT_EQ(count_ifs(), 2u);
++}
++
++TEST_F(nir_opt_vectorize_robust_ssbo_loads_test, normalizes_dword_bias_offsets)
++{
++   nir_def *res = resource();
++   nir_def *dword_base = nir_undef(b, 1, 32);
++   nir_intrinsic_instr *first = load(
++      res, nir_imul_imm(b, nir_iadd_imm(b, dword_base, 3), 4));
++   nir_intrinsic_instr *second = load(
++      res, nir_imul_imm(b, nir_iadd_imm(b, dword_base, 4), 4));
++   nir_vec2(b, &first->def, &second->def);
++
++   ASSERT_TRUE(nir_opt_vectorize_robust_ssbo_loads(b->shader));
++   nir_validate_shader(b->shader, NULL);
++   EXPECT_EQ(count_load_components(2), 1u);
++   EXPECT_EQ(count_load_components(1), 2u);
++}
++
++TEST_F(nir_opt_vectorize_robust_ssbo_loads_test,
++       specializes_all_captured_dword_biases)
++{
++   nir_def *base = nir_imm_int(b, 0);
++   for (unsigned bias = 0; bias <= 252; bias += 4) {
++      nir_def *res = resource(bias / 4 + 1);
++      nir_intrinsic_instr *first = load(res, nir_iadd_imm(b, base, bias));
++      nir_intrinsic_instr *second =
++         load(res, nir_iadd_imm(b, base, bias + 4));
++      nir_vec2(b, &first->def, &second->def);
++   }
++
++   ASSERT_TRUE(nir_opt_vectorize_robust_ssbo_loads(b->shader));
++   nir_shader *specialized = specialize_all_sizes(UINT32_MAX);
++   nir_shader *partial = specialize_bias_sizes(4);
++   nir_shader *empty = specialize_bias_sizes(0);
++   ASSERT_NE(specialized, nullptr);
++   ASSERT_NE(partial, nullptr);
++   ASSERT_NE(empty, nullptr);
++   EXPECT_EQ(count_shader_loads(specialized, 2), 64u);
++   EXPECT_EQ(count_shader_loads(specialized, 1), 0u);
++   EXPECT_EQ(count_shader_loads(partial, 2), 0u);
++   EXPECT_EQ(count_shader_loads(partial, 1), 128u);
++   EXPECT_EQ(count_shader_loads(empty, 2), 0u);
++   EXPECT_EQ(count_shader_loads(empty, 1), 128u);
++   for (unsigned bias = 0; bias <= 252; bias += 4)
++      EXPECT_EQ(count_shader_loads_at(specialized, 2, bias), 1u);
++   for (unsigned offset = 0; offset <= 256; offset += 4) {
++      const unsigned expected = offset == 0 || offset == 256 ? 1 : 2;
++      EXPECT_EQ(count_shader_loads_at(partial, 1, offset), expected);
++      EXPECT_EQ(count_shader_loads_at(empty, 1, offset), expected);
++   }
++   ralloc_free(specialized);
++   ralloc_free(partial);
++   ralloc_free(empty);
++}
++
++TEST_F(nir_opt_vectorize_robust_ssbo_loads_test,
++       maximum_offset_uses_scalar_fallback_without_wrap)
++{
++   const uint32_t low = UINT32_MAX - 4;
++   nir_def *res = resource();
++   nir_intrinsic_instr *first = load(res, nir_imm_int(b, low));
++   nir_intrinsic_instr *second = load(res, nir_imm_int(b, UINT32_MAX));
++   nir_vec2(b, &first->def, &second->def);
++
++   ASSERT_TRUE(nir_opt_vectorize_robust_ssbo_loads(b->shader));
++   nir_shader *specialized = specialize_all_sizes(UINT32_MAX);
++   ASSERT_NE(specialized, nullptr);
++   EXPECT_EQ(count_shader_loads(specialized, 2), 0u);
++   EXPECT_EQ(count_shader_loads(specialized, 1), 2u);
++   EXPECT_EQ(count_shader_loads_at(specialized, 1, low), 1u);
++   EXPECT_EQ(count_shader_loads_at(specialized, 1, UINT32_MAX), 1u);
++   ralloc_free(specialized);
++}
++
++TEST_F(nir_opt_vectorize_robust_ssbo_loads_test,
++       dynamic_maximum_offsets_keep_guarded_scalar_values)
++{
++   const uint32_t low = UINT32_MAX - 4;
++   nir_def *res = resource();
++   nir_def *base = nir_undef(b, 1, 32);
++   nir_intrinsic_instr *first =
++      load(res, nir_iadd_imm(b, base, low));
++   nir_intrinsic_instr *second =
++      load(res, nir_iadd_imm(b, base, UINT32_MAX));
++   nir_vec2(b, &first->def, &second->def);
++
++   ASSERT_TRUE(nir_opt_vectorize_robust_ssbo_loads(b->shader));
++   nir_validate_shader(b->shader, NULL);
++   EXPECT_EQ(count_load_components(2), 1u);
++   EXPECT_EQ(count_load_components(1), 2u);
++}
++
++TEST_F(nir_opt_vectorize_robust_ssbo_loads_test, merges_equivalent_descriptors_after_cse)
++{
++   nir_def *base = nir_undef(b, 1, 32);
++   nir_def *res0 = resource(0);
++   nir_def *res1 = resource(0);
++   nir_intrinsic_instr *first = load(res0, base);
++   nir_intrinsic_instr *second = load(res1, nir_iadd_imm(b, base, 4));
++   nir_vec2(b, &first->def, &second->def);
++
++   nir_opt_cse(b->shader);
++   ASSERT_TRUE(nir_opt_vectorize_robust_ssbo_loads(b->shader));
++   nir_validate_shader(b->shader, NULL);
++   EXPECT_EQ(count_load_components(2), 1u);
++}
++
++TEST_F(nir_opt_vectorize_robust_ssbo_loads_test,
++       normalizes_distinct_z_descriptor_extracts_with_copy_prop)
++{
++   nir_def *common = nir_vec3(b, nir_imm_int(b, 0x1000000),
++                              nir_imm_int(b, 0), nir_imm_int(b, 0));
++   nir_def *dynamic = nir_undef(b, 1, 32);
++   for (unsigned i = 0; i < 2; i++) {
++      nir_def *packed = nir_vec3(b, nir_channel(b, common, 0),
++                                 nir_channel(b, common, 1),
++                                 nir_iadd_imm(b, dynamic, i * 4));
++      nir_def *res = nir_channels(b, packed, 0x3);
++      load(res, nir_channel(b, packed, 2));
++   }
++
++   nir_shader *without_copy_prop = nir_shader_clone(NULL, b->shader);
++   nir_opt_constant_folding(without_copy_prop);
++   nir_opt_cse(without_copy_prop);
++   EXPECT_FALSE(nir_opt_vectorize_robust_ssbo_loads(without_copy_prop));
++   ralloc_free(without_copy_prop);
++
++   nir_opt_copy_prop(b->shader);
++   nir_opt_constant_folding(b->shader);
++   nir_opt_cse(b->shader);
++   EXPECT_TRUE(nir_opt_vectorize_robust_ssbo_loads(b->shader));
++   nir_validate_shader(b->shader, NULL);
++   EXPECT_EQ(count_load_components(2), 1u);
++}
++
++TEST_F(nir_opt_vectorize_robust_ssbo_loads_test, rejects_wrapped_contiguous_offsets)
++{
++   nir_def *res = resource();
++   load(res, nir_imm_int(b, UINT32_MAX));
++   load(res, nir_imm_int(b, 3));
++
++   EXPECT_FALSE(nir_opt_vectorize_robust_ssbo_loads(b->shader));
++   EXPECT_EQ(count(nir_intrinsic_load_ssbo), 2u);
++}
++
++}
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -885,6 +885,26 @@
+       NIR_PASS(_, nir, nir_opt_dce);
+    }
+ 
++#if PAN_ARCH >= 9
++   if (stage == MESA_SHADER_FRAGMENT &&
++       rs->storage_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT) {
++      if (PANVK_DEBUG(NIR)) {
++         mesa_logi("robust ssbo vectorization entry:");
++         nir_log_shaderi(nir);
++      }
++
++      NIR_PASS(_, nir, nir_opt_copy_prop);
++      NIR_PASS(_, nir, nir_opt_constant_folding);
++      NIR_PASS(_, nir, nir_opt_cse);
++      NIR_PASS(_, nir, nir_opt_vectorize_robust_ssbo_loads);
++
++      if (PANVK_DEBUG(NIR)) {
++         mesa_logi("robust ssbo vectorization exit:");
++         nir_log_shaderi(nir);
++      }
++   }
++#endif
++
+ #if PAN_ARCH >= 10
+    if (allow_merging_workgroups) {
+       /* Accesses that were uniform in the source shader may now be

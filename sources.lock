@@ -4,7 +4,7 @@
   "mesaVersion": "26.3.0-devel",
   "mesaBranch": "main",
   "pinnedOn": "2026-09-18",
-  "patchSeriesId": "sha256:fa256dc02bb222b979f72754cef64e149e6fb892e0b5a52a376b941d4e0d0da8",
+  "patchSeriesId": "sha256:7ee868e25c77fbdb99d44cea38df72a852551da26e37dde718194a942c829f04",
   "referenceRepos": {
     "g720-csf": {
       "url": "https://github.com/wonderkast02/panvk-g720-kbase-csf",
@@ -46,6 +46,7 @@
     }
   },
   "notes": [
+    "Research branch: robust SSBO vectorization is not a generally qualified performance release.",
     "No release may be built from an unrecorded moving branch.",
     "patchSeriesId is sha256 of mesaCommit + profile JSON + patches/** (scripts/compute-patch-series-id.py).",
     "Secondary history repos are intentionally unpinned; they are not build inputs."
