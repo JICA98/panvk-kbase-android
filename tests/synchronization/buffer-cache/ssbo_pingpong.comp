@@ -1,0 +1,28 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    uint source[];
+};
+
+layout(set = 0, binding = 1, std430) writeonly buffer OutputBuffer {
+    uint destination[];
+};
+
+layout(push_constant) uniform Params {
+    uint iteration;
+};
+
+void main()
+{
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= 1024u)
+        return;
+
+    uint value = source[index];
+    value ^= iteration * 0x9e3779b9u + index * 0x85ebca6bu;
+    value = value * 1664525u + 1013904223u;
+    value ^= value >> 16u;
+    destination[index] = value;
+}
