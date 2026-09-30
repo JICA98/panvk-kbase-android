@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jica98 <zenithblue.dev@gmail.com>
+Date: Wed, 30 Sep 2026 01:18:49 +0530
+Subject: [PATCH 2/7] panvk: kbase timestamp ns factor, arch-specific ZS
+ preload intersect, utrace clone ordering, trace subqueue tag
+
+Generated-by: LLM
+---
+ src/panfrost/lib/kmod/kbase_kmod.c            |  3 +++
+ src/panfrost/lib/pan_desc.h                   | 16 +++++++++++++--
+ src/panfrost/vulkan/csf/panvk_vX_instr.c      |  3 ++-
+ src/panfrost/vulkan/csf/panvk_vX_utrace.c     |  1 +
+ src/panfrost/vulkan/panvk_utrace.c            |  4 +++-
+ .../vulkan/panvk_vX_cmd_frame_shaders.c       | 20 +++++++++++++------
+ 6 files changed, 37 insertions(+), 10 deletions(-)
+
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index 0f98b735..68f07ee7 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -376,6 +376,9 @@ kbase_dev_query_props(struct kbase_kmod_dev *kbase_dev,
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(cntfrq));
+    props->timestamp_frequency = cntfrq;
+ #endif
++   if (props->timestamp_frequency)
++      props->timestamp_cycles_to_ns_factor =
++         1000000000.0 / (double)props->timestamp_frequency;
+ 
+    /* Priorities: kbase currently only advertises medium. */
+    props->allowed_group_priorities_mask =
+diff --git a/src/panfrost/lib/pan_desc.h b/src/panfrost/lib/pan_desc.h
+index 27bf80ce..7996e64c 100644
+--- a/src/panfrost/lib/pan_desc.h
++++ b/src/panfrost/lib/pan_desc.h
+@@ -405,10 +405,22 @@ static enum mali_pre_post_frame_shader_mode
+ pan_fix_frame_shader_mode(enum mali_pre_post_frame_shader_mode mode,
+                           bool force_clean_tile)
+ {
+-   if (force_clean_tile && mode == MALI_PRE_POST_FRAME_SHADER_MODE_INTERSECT)
++   if (!force_clean_tile)
++      return mode;
++
++   switch (mode) {
++   case MALI_PRE_POST_FRAME_SHADER_MODE_INTERSECT:
+       return MALI_PRE_POST_FRAME_SHADER_MODE_ALWAYS;
+-   else
++#if PAN_ARCH == 12
++   case MALI_PRE_POST_FRAME_SHADER_MODE_EARLY_ZS_INTERSECT:
++      return MALI_PRE_POST_FRAME_SHADER_MODE_EARLY_ZS_ALWAYS;
++#elif PAN_ARCH >= 13
++   case MALI_PRE_POST_FRAME_SHADER_MODE_PREPASS_INTERSECT:
++      return MALI_PRE_POST_FRAME_SHADER_MODE_PREPASS_ALWAYS;
++#endif
++   default:
+       return mode;
++   }
+ }
+ #endif
+ 
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_instr.c b/src/panfrost/vulkan/csf/panvk_vX_instr.c
+index 8cbd6371..165966e2 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_instr.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_instr.c
+@@ -32,7 +32,8 @@ panvk_instr_end_render(enum panvk_subqueue_id id,
+                        struct panvk_utrace_cs_info *cs_info,
+                        const struct panvk_instr_end_args *const args)
+ {
+-   trace_end_render(&cs_info->cmdbuf->utrace.uts[id], cs_info, args->render.flags,
++   trace_end_render(&cs_info->cmdbuf->utrace.uts[id], cs_info,
++                    args->render.flags | ((uint32_t)id << 24),
+                     args->render.fb);
+ }
+ 
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_utrace.c b/src/panfrost/vulkan/csf/panvk_vX_utrace.c
+index cec767e4..2ac310a2 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_utrace.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_utrace.c
+@@ -284,6 +284,7 @@ panvk_per_arch(utrace_clone_init_builder)(struct cs_builder *b,
+    /* Pass an empty root buffer so the builder allocates every CS chunk,
+     * including the first, through alloc_clone_cs_buffer(). */
+    cs_builder_init(b, &builder_conf, (struct cs_buffer){0});
++   cs_wait_slots(b, dev->csf.sb.all_mask);
+ }
+ 
+ void
+diff --git a/src/panfrost/vulkan/panvk_utrace.c b/src/panfrost/vulkan/panvk_utrace.c
+index f515ac7e..7fea7cc1 100644
+--- a/src/panfrost/vulkan/panvk_utrace.c
++++ b/src/panfrost/vulkan/panvk_utrace.c
+@@ -7,6 +7,8 @@
+ 
+ #include "panvk_utrace.h"
+ 
++#include <inttypes.h>
++
+ #include "kmod/pan_kmod.h"
+ #include "util/log.h"
+ #include "util/timespec.h"
+@@ -127,7 +129,7 @@ panvk_utrace_read_ts(struct u_trace_context *utctx, void *timestamps,
+ 
+    const uint64_t *ts_ptr = buf->host + offset_B;
+    uint64_t ts = *ts_ptr;
+-   if (ts != U_TRACE_NO_TIMESTAMP)
++  if (ts != U_TRACE_NO_TIMESTAMP)
+       ts = pan_kmod_timestamp_cycles_to_ns(pdev->kmod.dev, ts);
+ 
+    return ts;
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c b/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c
+index 45f58092..a7763298 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c
+@@ -819,14 +819,22 @@ cmd_preload_zs_attachments(struct panvk_cmd_buffer *cmdbuf,
+     *
+     * On v13+, we don't have EARLY_ZS_ALWAYS instead we use PREPASS_ALWAYS.
+     */
++#if PAN_ARCH >= 9
++   const bool zs_intersect = !always_load(load, &key) &&
++      !debug_get_bool_option("PANVK_ZS_PRELOAD_ALWAYS", false);
++#endif
+ #if PAN_ARCH >= 13
+-   fs->modes[dcd_idx] = MALI_PRE_POST_FRAME_SHADER_MODE_PREPASS_ALWAYS;
++   fs->modes[dcd_idx] = zs_intersect
++      ? MALI_PRE_POST_FRAME_SHADER_MODE_PREPASS_INTERSECT
++      : MALI_PRE_POST_FRAME_SHADER_MODE_PREPASS_ALWAYS;
++#elif PAN_ARCH >= 12
++   fs->modes[dcd_idx] = zs_intersect
++      ? MALI_PRE_POST_FRAME_SHADER_MODE_EARLY_ZS_INTERSECT
++      : MALI_PRE_POST_FRAME_SHADER_MODE_EARLY_ZS_ALWAYS;
+ #elif PAN_ARCH >= 9
+-   if (!always_load(load, &key) &&
+-       debug_get_bool_option("PANVK_ZS_PRELOAD_INTERSECT", false))
+-      fs->modes[dcd_idx] = MALI_PRE_POST_FRAME_SHADER_MODE_INTERSECT;
+-   else
+-      fs->modes[dcd_idx] = MALI_PRE_POST_FRAME_SHADER_MODE_EARLY_ZS_ALWAYS;
++   fs->modes[dcd_idx] = zs_intersect
++      ? MALI_PRE_POST_FRAME_SHADER_MODE_INTERSECT
++      : MALI_PRE_POST_FRAME_SHADER_MODE_EARLY_ZS_ALWAYS;
+ #else
+    /* We could use INTERSECT on Bifrost v7 too, but EARLY_ZS_ALWAYS has the
+     * advantage of reloading the ZS tile buffer one or more tiles ahead,

@@ -1,0 +1,417 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jica98 <zenithblue.dev@gmail.com>
+Date: Wed, 30 Sep 2026 00:24:36 +0530
+Subject: [PATCH 1/7] panvk: kbase timestamp frequency, utrace waits, ZS
+ preload intersect, dev env file, barrier stats
+
+Generated-by: LLM
+---
+ src/panfrost/lib/kmod/kbase_kmod.c            |   5 +
+ src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c | 125 ++++++++++++++++++
+ src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c  |  46 +++++++
+ src/panfrost/vulkan/panvk_instance.c          |  41 ++++++
+ src/panfrost/vulkan/panvk_utrace.c            |  19 +++
+ src/panfrost/vulkan/panvk_utrace.h            |   6 +
+ .../vulkan/panvk_vX_cmd_frame_shaders.c       |   7 +-
+ 7 files changed, 248 insertions(+), 1 deletion(-)
+
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index 16092a5c..0f98b735 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -371,6 +371,11 @@ kbase_dev_query_props(struct kbase_kmod_dev *kbase_dev,
+     * OS timestamps instead of cycle counts; callers that need accurate
+     * frequency should perform their own calibration. */
+    props->timestamp_frequency = 0;
++#if defined(__aarch64__)
++   uint64_t cntfrq;
++   __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(cntfrq));
++   props->timestamp_frequency = cntfrq;
++#endif
+ 
+    /* Priorities: kbase currently only advertises medium. */
+    props->allowed_group_priorities_mask =
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+index 21c2bcb4..a0e86412 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+@@ -16,6 +16,10 @@
+ 
+ #include "panvk_buffer.h"
+ #include "panvk_cmd_alloc.h"
++#include "util/os_time.h"
++#include "util/simple_mtx.h"
++#include "util/u_debug.h"
++#include <inttypes.h>
+ #include "panvk_cmd_buffer.h"
+ #include "panvk_cmd_desc_state.h"
+ #include "panvk_cmd_pool.h"
+@@ -766,6 +770,89 @@ panvk_per_arch(emit_barrier)(struct panvk_cmd_buffer *cmdbuf,
+    emit_barrier_csf(cmdbuf, deps);
+ }
+ 
++
++struct panvk_barrier_stat {
++   uint32_t kind;
++   uint64_t src_stage, dst_stage, src_access, dst_access;
++   uint32_t old_layout, new_layout;
++   uint64_t count;
++};
++
++static void
++panvk_barrier_stats_add(uint32_t kind, uint64_t ss, uint64_t ds, uint64_t sa,
++                        uint64_t da, uint32_t ol, uint32_t nl)
++{
++   static struct panvk_barrier_stat stats[96];
++   static unsigned nstats;
++   static uint64_t next_dump_ns, total;
++   static simple_mtx_t lock = SIMPLE_MTX_INITIALIZER;
++
++   simple_mtx_lock(&lock);
++   total++;
++   unsigned i;
++   for (i = 0; i < nstats; i++) {
++      struct panvk_barrier_stat *e = &stats[i];
++      if (e->kind == kind && e->src_stage == ss && e->dst_stage == ds &&
++          e->src_access == sa && e->dst_access == da && e->old_layout == ol &&
++          e->new_layout == nl)
++         break;
++   }
++   if (i == nstats && nstats < ARRAY_SIZE(stats))
++      stats[nstats++] = (struct panvk_barrier_stat){kind, ss, ds, sa, da, ol, nl, 0};
++   if (i < ARRAY_SIZE(stats))
++      stats[i].count++;
++
++   uint64_t now = os_time_get_nano();
++   if (!next_dump_ns)
++      next_dump_ns = now + 5000000000ull;
++   if (now >= next_dump_ns) {
++      next_dump_ns = now + 5000000000ull;
++      mesa_logw("panvk barrier stats: total=%" PRIu64 " entries=%u", total,
++                nstats);
++      for (unsigned j = 0; j < nstats; j++) {
++         struct panvk_barrier_stat *e = &stats[j];
++         if (e->count * 50 < total)
++            continue;
++         mesa_logw("  n=%" PRIu64 " kind=%u src=%#" PRIx64 "/%#" PRIx64
++                   " dst=%#" PRIx64 "/%#" PRIx64 " layout=%u->%u",
++                   e->count, e->kind, e->src_stage, e->src_access,
++                   e->dst_stage, e->dst_access, e->old_layout, e->new_layout);
++      }
++      for (unsigned j = 0; j < nstats; j++)
++         stats[j].count = 0;
++      total = 0;
++   }
++   simple_mtx_unlock(&lock);
++}
++
++static void
++panvk_barrier_stats(struct panvk_cmd_buffer *cmdbuf, const VkDependencyInfo *info)
++{
++   static int enabled = -1;
++   if (enabled < 0)
++      enabled = debug_get_bool_option("PANVK_BARRIER_STATS", false);
++   if (!enabled)
++      return;
++
++   uint32_t in_rp = cmdbuf->state.gfx.render.tiler ? 8 : 0;
++   for (uint32_t i = 0; i < info->memoryBarrierCount; i++) {
++      const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
++      panvk_barrier_stats_add(in_rp | 1, b->srcStageMask, b->dstStageMask,
++                              b->srcAccessMask, b->dstAccessMask, 0, 0);
++   }
++   for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; i++) {
++      const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
++      panvk_barrier_stats_add(in_rp | 2, b->srcStageMask, b->dstStageMask,
++                              b->srcAccessMask, b->dstAccessMask, 0, 0);
++   }
++   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
++      const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[i];
++      panvk_barrier_stats_add(in_rp | 4, b->srcStageMask, b->dstStageMask,
++                              b->srcAccessMask, b->dstAccessMask,
++                              b->oldLayout, b->newLayout);
++   }
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
+                                     const VkDependencyInfo *pDependencyInfo)
+@@ -773,6 +860,43 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+    struct panvk_cs_deps deps = {0};
+ 
++   panvk_barrier_stats(cmdbuf, pDependencyInfo);
++
++   static int exp_narrow = -1;
++   if (exp_narrow < 0)
++      exp_narrow = debug_get_bool_option("PANVK_EXP_NARROW_IMG_BARRIERS", false);
++   VkDependencyInfo narrowed_info;
++   STACK_ARRAY(VkImageMemoryBarrier2, narrowed,
++               exp_narrow ? pDependencyInfo->imageMemoryBarrierCount : 0);
++   if (exp_narrow && pDependencyInfo->imageMemoryBarrierCount) {
++      const VkPipelineStageFlags2 wide =
++         VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
++      const VkAccessFlags2 att =
++         VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
++         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
++         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
++      const VkPipelineStageFlags2 frag =
++         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
++         VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
++         VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
++         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
++      for (uint32_t i = 0; i < pDependencyInfo->imageMemoryBarrierCount; i++) {
++         narrowed[i] = pDependencyInfo->pImageMemoryBarriers[i];
++         VkImageMemoryBarrier2 *b = &narrowed[i];
++         bool att_to_read = (b->srcAccessMask & ~att) == 0 &&
++                            b->dstAccessMask == VK_ACCESS_2_SHADER_READ_BIT;
++         bool read_to_att = b->srcAccessMask == VK_ACCESS_2_SHADER_READ_BIT &&
++                            (b->dstAccessMask & ~att) == 0;
++         if (b->srcStageMask == wide && b->dstStageMask == wide &&
++             (att_to_read || read_to_att)) {
++            b->srcStageMask = frag;
++            b->dstStageMask = frag;
++         }
++      }
++      narrowed_info = *pDependencyInfo;
++      narrowed_info.pImageMemoryBarriers = narrowed;
++      pDependencyInfo = &narrowed_info;
++   }
+    panvk_per_arch(add_cs_deps)(cmdbuf, pDependencyInfo, &deps, false);
+ 
+    if (deps.needs_fb_barrier)
+@@ -792,6 +916,7 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
+    panvk_per_arch(emit_barrier)(cmdbuf, deps);
+ 
+    STACK_ARRAY_FINISH(crc_addrs);
++   STACK_ARRAY_FINISH(narrowed);
+ }
+ 
+ static struct cs_buffer
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+index d4d0168f..f7a23480 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+@@ -18,6 +18,11 @@
+ #include "panvk_queue.h"
+ #include "panvk_utrace.h"
+ 
++#include <dlfcn.h>
++#include <limits.h>
++#include <unistd.h>
++#include "util/os_time.h"
++
+ #include "pan_trace.h"
+ 
+ #include "util/bitscan.h"
+@@ -122,6 +127,31 @@ gpu_queue_uses_kbase(const struct panvk_device *dev)
+           '\0';
+ }
+ 
++static bool
++kbase_utrace_gate_open(void)
++{
++   static char gate_path[PATH_MAX];
++   static uint64_t next_check_ns;
++   static bool open_state;
++
++   if (!gate_path[0]) {
++      Dl_info info;
++      const char *slash;
++      if (!dladdr((void *)kbase_utrace_gate_open, &info) || !info.dli_fname ||
++          !(slash = strrchr(info.dli_fname, '/')))
++         return true;
++      snprintf(gate_path, sizeof(gate_path), "%.*s/panvk-utrace-on",
++               (int)(slash - info.dli_fname), info.dli_fname);
++   }
++
++   uint64_t now = os_time_get_nano();
++   if (now >= next_check_ns) {
++      open_state = access(gate_path, F_OK) == 0;
++      next_check_ns = now + 250000000ull;
++   }
++   return open_state;
++}
++
+ static uint32_t
+ kbase_resource_mask(enum panvk_subqueue_id subqueue)
+ {
+@@ -2275,6 +2305,10 @@ panvk_queue_submit_init(struct panvk_queue_submit *submit,
+    submit->process_utrace =
+       u_trace_should_process(&submit->dev->utrace.utctx) &&
+       submit->phys_dev->kmod.dev->props.timestamp_frequency;
++#ifdef HAVE_PAN_KMOD_KBASE
++   if (submit->process_utrace && gpu_queue_uses_kbase(submit->dev))
++      submit->process_utrace = kbase_utrace_gate_open();
++#endif
+ 
+    submit->force_sync = PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC);
+ }
+@@ -2812,6 +2846,18 @@ panvk_queue_submit_process_signals_kbase(struct panvk_queue_submit *submit,
+                                    kbase_wait_sync_targets,
+                                    submit->kbase_target_seqnos);
+    }
++
++   if (submit->utrace.queue_mask) {
++      struct panvk_utrace_flush_data *data =
++         submit->utrace.data[submit->utrace.first_subqueue];
++      STATIC_ASSERT(ARRAY_SIZE(data->wait_targets) >=
++                    PANVK_KBASE_SYNC_TARGET_COUNT);
++      memcpy(data->wait_targets, submit->kbase_target_seqnos,
++             sizeof(uint64_t) * PANVK_KBASE_SYNC_TARGET_COUNT);
++      data->wait_targets_data = submit->queue;
++      data->wait_targets_func = kbase_wait_sync_targets;
++      u_trace_context_process(&submit->dev->utrace.utctx, false);
++   }
+ }
+ #endif /* HAVE_PAN_KMOD_KBASE */
+ 
+diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
+index 3b7e15e9..77e3a3ee 100644
+--- a/src/panfrost/vulkan/panvk_instance.c
++++ b/src/panfrost/vulkan/panvk_instance.c
+@@ -17,7 +17,10 @@
+ #include "util/u_call_once.h"
+ 
+ #if defined(HAVE_PAN_KMOD_KBASE)
++#include <dlfcn.h>
+ #include <limits.h>
++#include <stdlib.h>
++#include <string.h>
+ #include <stdio.h>
+ #include <unistd.h>
+ #endif
+@@ -67,9 +70,47 @@ static const struct debug_control panvk_debug_options[] = {
+ 
+ uint64_t panvk_debug;
+ 
++#if defined(HAVE_PAN_KMOD_KBASE)
++static void
++panvk_load_env_file(void)
++{
++   Dl_info info;
++   if (!dladdr((void *)panvk_load_env_file, &info) || !info.dli_fname)
++      return;
++
++   char path[PATH_MAX];
++   const char *slash = strrchr(info.dli_fname, '/');
++   if (!slash)
++      return;
++   int dir_len = (int)(slash - info.dli_fname);
++   if (snprintf(path, sizeof(path), "%.*s/panvk-env.txt", dir_len,
++                info.dli_fname) >= (int)sizeof(path))
++      return;
++
++   FILE *f = fopen(path, "r");
++   if (!f)
++      return;
++
++   char line[512];
++   while (fgets(line, sizeof(line), f)) {
++      line[strcspn(line, "\r\n")] = '\0';
++      char *eq = strchr(line, '=');
++      if (line[0] == '#' || !eq || eq == line)
++         continue;
++      *eq = '\0';
++      setenv(line, eq + 1, 1);
++      mesa_logi("panvk: env file %s=%s", line, eq + 1);
++   }
++   fclose(f);
++}
++#endif
++
+ static void
+ panvk_debug_init_once(void)
+ {
++#if defined(HAVE_PAN_KMOD_KBASE)
++   panvk_load_env_file();
++#endif
+    panvk_debug =
+       parse_debug_string(os_get_option("PANVK_DEBUG"), panvk_debug_options);
+ }
+diff --git a/src/panfrost/vulkan/panvk_utrace.c b/src/panfrost/vulkan/panvk_utrace.c
+index 9c0442d3..f515ac7e 100644
+--- a/src/panfrost/vulkan/panvk_utrace.c
++++ b/src/panfrost/vulkan/panvk_utrace.c
+@@ -53,6 +53,8 @@ panvk_utrace_create_buffer(struct u_trace_context *utctx, uint64_t size_B)
+    };
+ 
+    memset(addr_host, 0, size_B);
++   panvk_priv_bo_flush(dev->utrace.copy_buf_heap_bo,
++                       addr_dev - dev->utrace.copy_buf_heap_bo->addr.dev, size_B);
+ 
+    return container;
+ }
+@@ -106,6 +108,23 @@ panvk_utrace_read_ts(struct u_trace_context *utctx, void *timestamps,
+       data->wait_value = 0;
+    }
+ 
++   if (data->wait_targets_func) {
++      if (data->wait_targets_func(data->wait_targets_data, data->wait_targets,
++                                  UINT64_MAX) != VK_SUCCESS)
++         mesa_logw("failed to wait for utrace timestamps");
++
++      data->wait_targets_func = NULL;
++   }
++
++   if (!buf->invalidated) {
++      struct panvk_priv_bo *heap_bo = dev->utrace.copy_buf_heap_bo;
++      panvk_priv_bo_invalidate(heap_bo,
++                               (uint8_t *)buf->host - (uint8_t *)heap_bo->addr.host,
++                               buf->size);
++      pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
++      ((struct panvk_utrace_buf *)buf)->invalidated = true;
++   }
++
+    const uint64_t *ts_ptr = buf->host + offset_B;
+    uint64_t ts = *ts_ptr;
+    if (ts != U_TRACE_NO_TIMESTAMP)
+diff --git a/src/panfrost/vulkan/panvk_utrace.h b/src/panfrost/vulkan/panvk_utrace.h
+index 1922cda3..ea2fcdb8 100644
+--- a/src/panfrost/vulkan/panvk_utrace.h
++++ b/src/panfrost/vulkan/panvk_utrace.h
+@@ -22,6 +22,11 @@ struct panvk_utrace_flush_data {
+    struct vk_sync *sync;
+    uint64_t wait_value;
+ 
++   VkResult (*wait_targets_func)(void *data, const uint64_t *targets,
++                                 uint64_t abs_timeout_ns);
++   void *wait_targets_data;
++   uint64_t wait_targets[4];
++
+    struct util_dynarray clone_cs_bufs;
+    bool free_self;
+ };
+@@ -30,6 +35,7 @@ struct panvk_utrace_buf {
+    uint64_t dev;
+    uint64_t size;
+    void *host;
++   bool invalidated;
+ };
+ 
+ void *panvk_utrace_create_buffer(struct u_trace_context *utctx,
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c b/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c
+index f2f80912..45f58092 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c
+@@ -3,6 +3,7 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include "util/u_debug.h"
+ #include "panvk_cmd_frame_shaders.h"
+ 
+ #include "panvk_cmd_alloc.h"
+@@ -821,7 +822,11 @@ cmd_preload_zs_attachments(struct panvk_cmd_buffer *cmdbuf,
+ #if PAN_ARCH >= 13
+    fs->modes[dcd_idx] = MALI_PRE_POST_FRAME_SHADER_MODE_PREPASS_ALWAYS;
+ #elif PAN_ARCH >= 9
+-   fs->modes[dcd_idx] = MALI_PRE_POST_FRAME_SHADER_MODE_EARLY_ZS_ALWAYS;
++   if (!always_load(load, &key) &&
++       debug_get_bool_option("PANVK_ZS_PRELOAD_INTERSECT", false))
++      fs->modes[dcd_idx] = MALI_PRE_POST_FRAME_SHADER_MODE_INTERSECT;
++   else
++      fs->modes[dcd_idx] = MALI_PRE_POST_FRAME_SHADER_MODE_EARLY_ZS_ALWAYS;
+ #else
+    /* We could use INTERSECT on Bifrost v7 too, but EARLY_ZS_ALWAYS has the
+     * advantage of reloading the ZS tile buffer one or more tiles ahead,

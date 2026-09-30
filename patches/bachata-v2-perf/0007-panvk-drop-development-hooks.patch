@@ -1,0 +1,291 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jica98 <jica.etzc@gmail.com>
+Date: Wed, 30 Sep 2026 05:48:15 +0530
+Subject: [PATCH 7/7] panvk: drop development hooks
+
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c | 125 ------------------
+ src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c  |  34 -----
+ src/panfrost/vulkan/panvk_instance.c          |  41 ------
+ 3 files changed, 200 deletions(-)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+index a0e86412..21c2bcb4 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+@@ -16,10 +16,6 @@
+ 
+ #include "panvk_buffer.h"
+ #include "panvk_cmd_alloc.h"
+-#include "util/os_time.h"
+-#include "util/simple_mtx.h"
+-#include "util/u_debug.h"
+-#include <inttypes.h>
+ #include "panvk_cmd_buffer.h"
+ #include "panvk_cmd_desc_state.h"
+ #include "panvk_cmd_pool.h"
+@@ -770,89 +766,6 @@ panvk_per_arch(emit_barrier)(struct panvk_cmd_buffer *cmdbuf,
+    emit_barrier_csf(cmdbuf, deps);
+ }
+ 
+-
+-struct panvk_barrier_stat {
+-   uint32_t kind;
+-   uint64_t src_stage, dst_stage, src_access, dst_access;
+-   uint32_t old_layout, new_layout;
+-   uint64_t count;
+-};
+-
+-static void
+-panvk_barrier_stats_add(uint32_t kind, uint64_t ss, uint64_t ds, uint64_t sa,
+-                        uint64_t da, uint32_t ol, uint32_t nl)
+-{
+-   static struct panvk_barrier_stat stats[96];
+-   static unsigned nstats;
+-   static uint64_t next_dump_ns, total;
+-   static simple_mtx_t lock = SIMPLE_MTX_INITIALIZER;
+-
+-   simple_mtx_lock(&lock);
+-   total++;
+-   unsigned i;
+-   for (i = 0; i < nstats; i++) {
+-      struct panvk_barrier_stat *e = &stats[i];
+-      if (e->kind == kind && e->src_stage == ss && e->dst_stage == ds &&
+-          e->src_access == sa && e->dst_access == da && e->old_layout == ol &&
+-          e->new_layout == nl)
+-         break;
+-   }
+-   if (i == nstats && nstats < ARRAY_SIZE(stats))
+-      stats[nstats++] = (struct panvk_barrier_stat){kind, ss, ds, sa, da, ol, nl, 0};
+-   if (i < ARRAY_SIZE(stats))
+-      stats[i].count++;
+-
+-   uint64_t now = os_time_get_nano();
+-   if (!next_dump_ns)
+-      next_dump_ns = now + 5000000000ull;
+-   if (now >= next_dump_ns) {
+-      next_dump_ns = now + 5000000000ull;
+-      mesa_logw("panvk barrier stats: total=%" PRIu64 " entries=%u", total,
+-                nstats);
+-      for (unsigned j = 0; j < nstats; j++) {
+-         struct panvk_barrier_stat *e = &stats[j];
+-         if (e->count * 50 < total)
+-            continue;
+-         mesa_logw("  n=%" PRIu64 " kind=%u src=%#" PRIx64 "/%#" PRIx64
+-                   " dst=%#" PRIx64 "/%#" PRIx64 " layout=%u->%u",
+-                   e->count, e->kind, e->src_stage, e->src_access,
+-                   e->dst_stage, e->dst_access, e->old_layout, e->new_layout);
+-      }
+-      for (unsigned j = 0; j < nstats; j++)
+-         stats[j].count = 0;
+-      total = 0;
+-   }
+-   simple_mtx_unlock(&lock);
+-}
+-
+-static void
+-panvk_barrier_stats(struct panvk_cmd_buffer *cmdbuf, const VkDependencyInfo *info)
+-{
+-   static int enabled = -1;
+-   if (enabled < 0)
+-      enabled = debug_get_bool_option("PANVK_BARRIER_STATS", false);
+-   if (!enabled)
+-      return;
+-
+-   uint32_t in_rp = cmdbuf->state.gfx.render.tiler ? 8 : 0;
+-   for (uint32_t i = 0; i < info->memoryBarrierCount; i++) {
+-      const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
+-      panvk_barrier_stats_add(in_rp | 1, b->srcStageMask, b->dstStageMask,
+-                              b->srcAccessMask, b->dstAccessMask, 0, 0);
+-   }
+-   for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; i++) {
+-      const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
+-      panvk_barrier_stats_add(in_rp | 2, b->srcStageMask, b->dstStageMask,
+-                              b->srcAccessMask, b->dstAccessMask, 0, 0);
+-   }
+-   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
+-      const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[i];
+-      panvk_barrier_stats_add(in_rp | 4, b->srcStageMask, b->dstStageMask,
+-                              b->srcAccessMask, b->dstAccessMask,
+-                              b->oldLayout, b->newLayout);
+-   }
+-}
+-
+ VKAPI_ATTR void VKAPI_CALL
+ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
+                                     const VkDependencyInfo *pDependencyInfo)
+@@ -860,43 +773,6 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+    struct panvk_cs_deps deps = {0};
+ 
+-   panvk_barrier_stats(cmdbuf, pDependencyInfo);
+-
+-   static int exp_narrow = -1;
+-   if (exp_narrow < 0)
+-      exp_narrow = debug_get_bool_option("PANVK_EXP_NARROW_IMG_BARRIERS", false);
+-   VkDependencyInfo narrowed_info;
+-   STACK_ARRAY(VkImageMemoryBarrier2, narrowed,
+-               exp_narrow ? pDependencyInfo->imageMemoryBarrierCount : 0);
+-   if (exp_narrow && pDependencyInfo->imageMemoryBarrierCount) {
+-      const VkPipelineStageFlags2 wide =
+-         VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+-      const VkAccessFlags2 att =
+-         VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+-         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+-         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+-      const VkPipelineStageFlags2 frag =
+-         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+-         VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+-         VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+-         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+-      for (uint32_t i = 0; i < pDependencyInfo->imageMemoryBarrierCount; i++) {
+-         narrowed[i] = pDependencyInfo->pImageMemoryBarriers[i];
+-         VkImageMemoryBarrier2 *b = &narrowed[i];
+-         bool att_to_read = (b->srcAccessMask & ~att) == 0 &&
+-                            b->dstAccessMask == VK_ACCESS_2_SHADER_READ_BIT;
+-         bool read_to_att = b->srcAccessMask == VK_ACCESS_2_SHADER_READ_BIT &&
+-                            (b->dstAccessMask & ~att) == 0;
+-         if (b->srcStageMask == wide && b->dstStageMask == wide &&
+-             (att_to_read || read_to_att)) {
+-            b->srcStageMask = frag;
+-            b->dstStageMask = frag;
+-         }
+-      }
+-      narrowed_info = *pDependencyInfo;
+-      narrowed_info.pImageMemoryBarriers = narrowed;
+-      pDependencyInfo = &narrowed_info;
+-   }
+    panvk_per_arch(add_cs_deps)(cmdbuf, pDependencyInfo, &deps, false);
+ 
+    if (deps.needs_fb_barrier)
+@@ -916,7 +792,6 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
+    panvk_per_arch(emit_barrier)(cmdbuf, deps);
+ 
+    STACK_ARRAY_FINISH(crc_addrs);
+-   STACK_ARRAY_FINISH(narrowed);
+ }
+ 
+ static struct cs_buffer
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+index 4d344eb3..7eac0cf3 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+@@ -18,11 +18,6 @@
+ #include "panvk_queue.h"
+ #include "panvk_utrace.h"
+ 
+-#include <dlfcn.h>
+-#include <limits.h>
+-#include <unistd.h>
+-#include "util/os_time.h"
+-
+ #include "pan_trace.h"
+ 
+ #include "util/bitscan.h"
+@@ -127,31 +122,6 @@ gpu_queue_uses_kbase(const struct panvk_device *dev)
+           '\0';
+ }
+ 
+-static bool
+-kbase_utrace_gate_open(void)
+-{
+-   static char gate_path[PATH_MAX];
+-   static uint64_t next_check_ns;
+-   static bool open_state;
+-
+-   if (!gate_path[0]) {
+-      Dl_info info;
+-      const char *slash;
+-      if (!dladdr((void *)kbase_utrace_gate_open, &info) || !info.dli_fname ||
+-          !(slash = strrchr(info.dli_fname, '/')))
+-         return true;
+-      snprintf(gate_path, sizeof(gate_path), "%.*s/panvk-utrace-on",
+-               (int)(slash - info.dli_fname), info.dli_fname);
+-   }
+-
+-   uint64_t now = os_time_get_nano();
+-   if (now >= next_check_ns) {
+-      open_state = access(gate_path, F_OK) == 0;
+-      next_check_ns = now + 250000000ull;
+-   }
+-   return open_state;
+-}
+-
+ static uint32_t
+ kbase_resource_mask(enum panvk_subqueue_id subqueue)
+ {
+@@ -2314,10 +2284,6 @@ panvk_queue_submit_init(struct panvk_queue_submit *submit,
+    submit->process_utrace =
+       u_trace_should_process(&submit->dev->utrace.utctx) &&
+       submit->phys_dev->kmod.dev->props.timestamp_frequency;
+-#ifdef HAVE_PAN_KMOD_KBASE
+-   if (submit->process_utrace && gpu_queue_uses_kbase(submit->dev))
+-      submit->process_utrace = kbase_utrace_gate_open();
+-#endif
+ 
+    submit->force_sync = PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC);
+ }
+diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
+index 77e3a3ee..3b7e15e9 100644
+--- a/src/panfrost/vulkan/panvk_instance.c
++++ b/src/panfrost/vulkan/panvk_instance.c
+@@ -17,10 +17,7 @@
+ #include "util/u_call_once.h"
+ 
+ #if defined(HAVE_PAN_KMOD_KBASE)
+-#include <dlfcn.h>
+ #include <limits.h>
+-#include <stdlib.h>
+-#include <string.h>
+ #include <stdio.h>
+ #include <unistd.h>
+ #endif
+@@ -70,47 +67,9 @@ static const struct debug_control panvk_debug_options[] = {
+ 
+ uint64_t panvk_debug;
+ 
+-#if defined(HAVE_PAN_KMOD_KBASE)
+-static void
+-panvk_load_env_file(void)
+-{
+-   Dl_info info;
+-   if (!dladdr((void *)panvk_load_env_file, &info) || !info.dli_fname)
+-      return;
+-
+-   char path[PATH_MAX];
+-   const char *slash = strrchr(info.dli_fname, '/');
+-   if (!slash)
+-      return;
+-   int dir_len = (int)(slash - info.dli_fname);
+-   if (snprintf(path, sizeof(path), "%.*s/panvk-env.txt", dir_len,
+-                info.dli_fname) >= (int)sizeof(path))
+-      return;
+-
+-   FILE *f = fopen(path, "r");
+-   if (!f)
+-      return;
+-
+-   char line[512];
+-   while (fgets(line, sizeof(line), f)) {
+-      line[strcspn(line, "\r\n")] = '\0';
+-      char *eq = strchr(line, '=');
+-      if (line[0] == '#' || !eq || eq == line)
+-         continue;
+-      *eq = '\0';
+-      setenv(line, eq + 1, 1);
+-      mesa_logi("panvk: env file %s=%s", line, eq + 1);
+-   }
+-   fclose(f);
+-}
+-#endif
+-
+ static void
+ panvk_debug_init_once(void)
+ {
+-#if defined(HAVE_PAN_KMOD_KBASE)
+-   panvk_load_env_file();
+-#endif
+    panvk_debug =
+       parse_debug_string(os_get_option("PANVK_DEBUG"), panvk_debug_options);
+ }
