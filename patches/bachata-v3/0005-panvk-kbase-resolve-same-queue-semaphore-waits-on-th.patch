@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jica98 <jica.etzc@gmail.com>
+Date: Wed, 30 Sep 2026 02:40:53 +0530
+Subject: [PATCH 5/6] panvk/kbase: resolve same-queue semaphore waits on the
+ GPU by default
+
+Upstream now implements GPU-side semaphore waits behind
+PANVK_KBASE_GPU_SEMAPHORE_WAITS, off by default. Bachata turns it on: it
+removes a CPU round trip per submit. Set the variable to 0 for CPU waits.
+---
+ src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+index 10c3736e..18ee0eea 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+@@ -2712,10 +2712,13 @@ panvk_queue_submit_init_signals(struct panvk_queue_submit *submit,
+ }
+ 
+ #ifdef HAVE_PAN_KMOD_KBASE
+-/* Off by default: G615 query_pool.statistics_query CTS loses the device on
+- * subqueue 0 with GPU waits (1-3 of 17769), never with CPU waits. */
++/* On by default for Bachata: resolving same-queue waits on the GPU removes a
++ * CPU round trip per submit (Dark Souls corridor 13.7 -> 16.4 FPS on G615).
++ * Upstream keeps this off because G615 query_pool.statistics_query CTS loses
++ * the device on subqueue 0 with GPU waits (1-3 of 17769). Set
++ * PANVK_KBASE_GPU_SEMAPHORE_WAITS=0 to use CPU waits. */
+ DEBUG_GET_ONCE_BOOL_OPTION(kbase_gpu_semaphore_waits,
+-                           "PANVK_KBASE_GPU_SEMAPHORE_WAITS", false)
++                           "PANVK_KBASE_GPU_SEMAPHORE_WAITS", true)
+ 
+ static bool
+ kbase_gpu_waits_disabled(void)

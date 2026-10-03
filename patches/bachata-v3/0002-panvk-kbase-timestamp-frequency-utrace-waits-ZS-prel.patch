@@ -1,38 +1,21 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: jica98 <zenithblue.dev@gmail.com>
 Date: Wed, 30 Sep 2026 00:24:36 +0530
-Subject: [PATCH 1/7] panvk: kbase timestamp frequency, utrace waits, ZS
+Subject: [PATCH 2/6] panvk: kbase timestamp frequency, utrace waits, ZS
  preload intersect, dev env file, barrier stats
 
 Generated-by: LLM
 ---
- src/panfrost/lib/kmod/kbase_kmod.c            |   5 +
  src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c | 125 ++++++++++++++++++
- src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c  |  46 +++++++
+ src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c  |  46 ++++++-
  src/panfrost/vulkan/panvk_instance.c          |  41 ++++++
  src/panfrost/vulkan/panvk_utrace.c            |  19 +++
  src/panfrost/vulkan/panvk_utrace.h            |   6 +
  .../vulkan/panvk_vX_cmd_frame_shaders.c       |   7 +-
- 7 files changed, 248 insertions(+), 1 deletion(-)
+ 6 files changed, 241 insertions(+), 3 deletions(-)
 
-diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
-index 16092a5c..0f98b735 100644
---- a/src/panfrost/lib/kmod/kbase_kmod.c
-+++ b/src/panfrost/lib/kmod/kbase_kmod.c
-@@ -371,6 +371,11 @@ kbase_dev_query_props(struct kbase_kmod_dev *kbase_dev,
-     * OS timestamps instead of cycle counts; callers that need accurate
-     * frequency should perform their own calibration. */
-    props->timestamp_frequency = 0;
-+#if defined(__aarch64__)
-+   uint64_t cntfrq;
-+   __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(cntfrq));
-+   props->timestamp_frequency = cntfrq;
-+#endif
- 
-    /* Priorities: kbase currently only advertises medium. */
-    props->allowed_group_priorities_mask =
 diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
-index 21c2bcb4..a0e86412 100644
+index 85174dd9..13669276 100644
 --- a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
 +++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
 @@ -16,6 +16,10 @@
@@ -46,7 +29,7 @@ index 21c2bcb4..a0e86412 100644
  #include "panvk_cmd_buffer.h"
  #include "panvk_cmd_desc_state.h"
  #include "panvk_cmd_pool.h"
-@@ -766,6 +770,89 @@ panvk_per_arch(emit_barrier)(struct panvk_cmd_buffer *cmdbuf,
+@@ -826,6 +830,89 @@ panvk_per_arch(emit_barrier)(struct panvk_cmd_buffer *cmdbuf,
     emit_barrier_csf(cmdbuf, deps);
  }
  
@@ -136,7 +119,7 @@ index 21c2bcb4..a0e86412 100644
  VKAPI_ATTR void VKAPI_CALL
  panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
                                      const VkDependencyInfo *pDependencyInfo)
-@@ -773,6 +860,43 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
+@@ -833,6 +920,43 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
     struct panvk_cs_deps deps = {0};
  
@@ -180,16 +163,16 @@ index 21c2bcb4..a0e86412 100644
     panvk_per_arch(add_cs_deps)(cmdbuf, pDependencyInfo, &deps, false);
  
     if (deps.needs_fb_barrier)
-@@ -792,6 +916,7 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
-    panvk_per_arch(emit_barrier)(cmdbuf, deps);
- 
+@@ -854,6 +978,7 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
     STACK_ARRAY_FINISH(crc_addrs);
+ 
+    panvk_per_arch(cmd_bc_decode_zero_initialized)(cmdbuf, pDependencyInfo);
 +   STACK_ARRAY_FINISH(narrowed);
  }
  
  static struct cs_buffer
 diff --git a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
-index d4d0168f..f7a23480 100644
+index 016e58af..10c3736e 100644
 --- a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
 +++ b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
 @@ -18,6 +18,11 @@
@@ -236,20 +219,20 @@ index d4d0168f..f7a23480 100644
  static uint32_t
  kbase_resource_mask(enum panvk_subqueue_id subqueue)
  {
-@@ -2275,6 +2305,10 @@ panvk_queue_submit_init(struct panvk_queue_submit *submit,
-    submit->process_utrace =
+@@ -2311,8 +2341,8 @@ panvk_queue_submit_init(struct panvk_queue_submit *submit,
        u_trace_should_process(&submit->dev->utrace.utctx) &&
        submit->phys_dev->kmod.dev->props.timestamp_frequency;
-+#ifdef HAVE_PAN_KMOD_KBASE
+ #ifdef HAVE_PAN_KMOD_KBASE
+-   if (gpu_queue_uses_kbase(submit->dev))
+-      submit->process_utrace = false;
 +   if (submit->process_utrace && gpu_queue_uses_kbase(submit->dev))
 +      submit->process_utrace = kbase_utrace_gate_open();
-+#endif
+ #endif
  
     submit->force_sync = PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC);
- }
-@@ -2812,6 +2846,18 @@ panvk_queue_submit_process_signals_kbase(struct panvk_queue_submit *submit,
+@@ -2893,6 +2923,18 @@ panvk_queue_submit_process_signals_kbase(struct panvk_queue_submit *submit,
                                     kbase_wait_sync_targets,
-                                    submit->kbase_target_seqnos);
+                                    submit->kbase_target_seqnos, addrs);
     }
 +
 +   if (submit->utrace.queue_mask) {
@@ -267,7 +250,7 @@ index d4d0168f..f7a23480 100644
  #endif /* HAVE_PAN_KMOD_KBASE */
  
 diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
-index 3b7e15e9..77e3a3ee 100644
+index a9c1a05f..dcacd09c 100644
 --- a/src/panfrost/vulkan/panvk_instance.c
 +++ b/src/panfrost/vulkan/panvk_instance.c
 @@ -17,7 +17,10 @@
@@ -281,7 +264,7 @@ index 3b7e15e9..77e3a3ee 100644
  #include <stdio.h>
  #include <unistd.h>
  #endif
-@@ -67,9 +70,47 @@ static const struct debug_control panvk_debug_options[] = {
+@@ -71,9 +74,47 @@ static const struct debug_control panvk_debug_options[] = {
  
  uint64_t panvk_debug;
  
@@ -391,7 +374,7 @@ index 1922cda3..ea2fcdb8 100644
  
  void *panvk_utrace_create_buffer(struct u_trace_context *utctx,
 diff --git a/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c b/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c
-index f2f80912..45f58092 100644
+index 4e1b5c6e..97f57d14 100644
 --- a/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c
 +++ b/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c
 @@ -3,6 +3,7 @@
@@ -402,9 +385,9 @@ index f2f80912..45f58092 100644
  #include "panvk_cmd_frame_shaders.h"
  
  #include "panvk_cmd_alloc.h"
-@@ -821,7 +822,11 @@ cmd_preload_zs_attachments(struct panvk_cmd_buffer *cmdbuf,
- #if PAN_ARCH >= 13
-    fs->modes[dcd_idx] = MALI_PRE_POST_FRAME_SHADER_MODE_PREPASS_ALWAYS;
+@@ -834,7 +835,11 @@ cmd_preload_zs_attachments(struct panvk_cmd_buffer *cmdbuf,
+                         ? MALI_PRE_POST_FRAME_SHADER_MODE_EARLY_ZS_ALWAYS
+                         : MALI_PRE_POST_FRAME_SHADER_MODE_INTERSECT;
  #elif PAN_ARCH >= 9
 -   fs->modes[dcd_idx] = MALI_PRE_POST_FRAME_SHADER_MODE_EARLY_ZS_ALWAYS;
 +   if (!always_load(load, &key) &&

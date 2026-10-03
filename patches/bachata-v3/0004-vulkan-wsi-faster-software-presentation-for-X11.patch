@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: jica98 <jica.etzc@gmail.com>
 Date: Wed, 30 Sep 2026 02:40:53 +0530
-Subject: [PATCH 4/7] vulkan/wsi: faster software presentation for X11
+Subject: [PATCH 4/6] vulkan/wsi: faster software presentation for X11
 
 Prefer a host-cached memory type for the CPU-side present image even when
 it is not host-coherent, invalidating the mapping before the present
@@ -17,10 +17,10 @@ Generated-by: LLM
  4 files changed, 63 insertions(+), 4 deletions(-)
 
 diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
-index cd1eeeee..9a635d01 100644
+index 2bca1a2d..e1eaa006 100644
 --- a/src/vulkan/wsi/wsi_common.c
 +++ b/src/vulkan/wsi/wsi_common.c
-@@ -234,6 +234,7 @@ wsi_device_init(struct wsi_device *wsi,
+@@ -237,6 +237,7 @@ wsi_device_init(struct wsi_device *wsi,
     WSI_GET_CB(SetDebugUtilsObjectNameEXT);
     WSI_GET_CB(WaitForFences);
     WSI_GET_CB(MapMemory);
@@ -28,7 +28,7 @@ index cd1eeeee..9a635d01 100644
     WSI_GET_CB(UnmapMemory);
     if (wsi->has_present_wait)
        WSI_GET_CB(WaitSemaphores);
-@@ -2879,7 +2880,7 @@ wsi_common_queue_present(const struct wsi_device *wsi,
+@@ -2889,7 +2890,7 @@ wsi_common_queue_present(const struct wsi_device *wsi,
  #endif
        }
  
@@ -37,7 +37,7 @@ index cd1eeeee..9a635d01 100644
           wsi->WaitForFences(vk_device_to_handle(dev),
                              1, &swapchain->fences[image_index], true, ~0ull);
        }
-@@ -3076,12 +3077,52 @@ wsi_select_host_memory_type(const struct wsi_device *wsi,
+@@ -3086,12 +3087,52 @@ wsi_select_host_memory_type(const struct wsi_device *wsi,
  {
     VkMemoryPropertyFlags req_props = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
  
@@ -92,7 +92,7 @@ index cd1eeeee..9a635d01 100644
  VkResult
  wsi_create_buffer_blit_context(const struct wsi_swapchain *chain,
                                 const struct wsi_image_info *info,
-@@ -3167,6 +3208,9 @@ wsi_create_buffer_blit_context(const struct wsi_swapchain *chain,
+@@ -3177,6 +3218,9 @@ wsi_create_buffer_blit_context(const struct wsi_swapchain *chain,
     if (result != VK_SUCCESS)
        return result;
  
@@ -102,7 +102,7 @@ index cd1eeeee..9a635d01 100644
     result = wsi->BindBufferMemory(chain->device, image->blit.buffer,
                                    image->blit.memory, 0);
     if (result != VK_SUCCESS)
-@@ -3559,6 +3603,9 @@ wsi_create_cpu_linear_image_mem(const struct wsi_swapchain *chain,
+@@ -3569,6 +3613,9 @@ wsi_create_cpu_linear_image_mem(const struct wsi_swapchain *chain,
     if (result != VK_SUCCESS)
        return result;
  
@@ -125,7 +125,7 @@ index cfb921da..d4c97aec 100644
     WSI_CB(QueueSubmit2);
     WSI_CB(SetDebugUtilsObjectNameEXT);
 diff --git a/src/vulkan/wsi/wsi_common_private.h b/src/vulkan/wsi/wsi_common_private.h
-index 3d2cd7d2..f933032e 100644
+index 0b1f5f49..44ef5ba3 100644
 --- a/src/vulkan/wsi/wsi_common_private.h
 +++ b/src/vulkan/wsi/wsi_common_private.h
 @@ -191,6 +191,8 @@ struct wsi_image {
@@ -158,10 +158,10 @@ index 3d2cd7d2..f933032e 100644
  wsi_cpu_image_needs_buffer_blit(const struct wsi_device *wsi,
                                  const struct wsi_cpu_image_params *params);
 diff --git a/src/vulkan/wsi/wsi_common_x11.c b/src/vulkan/wsi/wsi_common_x11.c
-index e2e6ef8a..1187f99e 100644
+index c9d35d31..80192fe7 100644
 --- a/src/vulkan/wsi/wsi_common_x11.c
 +++ b/src/vulkan/wsi/wsi_common_x11.c
-@@ -1874,6 +1874,7 @@ x11_present_to_x11_sw(struct x11_swapchain *chain, uint32_t image_index)
+@@ -1883,6 +1883,7 @@ x11_present_to_x11_sw(struct x11_swapchain *chain, uint32_t image_index)
     xcb_get_geometry_cookie_t geom_cookie = xcb_get_geometry(chain->conn, chain->window);
  
     xcb_void_cookie_t cookie;
@@ -169,7 +169,7 @@ index e2e6ef8a..1187f99e 100644
     void *myptr = image->base.cpu_map;
     size_t hdr_len = sizeof(xcb_put_image_request_t);
     int stride_b = image->base.row_pitches[0];
-@@ -2542,7 +2543,8 @@ x11_manage_present_queue(void *state)
+@@ -2560,7 +2561,8 @@ x11_manage_present_queue(void *state)
  
        /* Not necessary to block when we have explicit sync */
        bool need_fence_wait =
@@ -179,7 +179,7 @@ index e2e6ef8a..1187f99e 100644
              !chain->base.image_info.explicit_sync;
  
        bool need_timing_fence_wait = x11_swapchain_present_timing_is_out_of_order_completion(
-@@ -3292,6 +3294,7 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+@@ -3310,6 +3312,7 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
     chain->status = VK_SUCCESS;
     chain->has_dri3_modifiers = wsi_conn->has_dri3_modifiers;
     chain->has_mit_shm = wsi_conn->has_mit_shm;

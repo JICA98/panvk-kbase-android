@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: jica98 <jica.etzc@gmail.com>
 Date: Wed, 30 Sep 2026 05:48:15 +0530
-Subject: [PATCH 7/7] panvk: drop development hooks
+Subject: [PATCH 6/6] panvk: drop development hooks
 
 Generated-by: LLM
 ---
@@ -11,7 +11,7 @@ Generated-by: LLM
  3 files changed, 200 deletions(-)
 
 diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
-index a0e86412..21c2bcb4 100644
+index 13669276..85174dd9 100644
 --- a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
 +++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
 @@ -16,10 +16,6 @@
@@ -25,7 +25,7 @@ index a0e86412..21c2bcb4 100644
  #include "panvk_cmd_buffer.h"
  #include "panvk_cmd_desc_state.h"
  #include "panvk_cmd_pool.h"
-@@ -770,89 +766,6 @@ panvk_per_arch(emit_barrier)(struct panvk_cmd_buffer *cmdbuf,
+@@ -830,89 +826,6 @@ panvk_per_arch(emit_barrier)(struct panvk_cmd_buffer *cmdbuf,
     emit_barrier_csf(cmdbuf, deps);
  }
  
@@ -115,7 +115,7 @@ index a0e86412..21c2bcb4 100644
  VKAPI_ATTR void VKAPI_CALL
  panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
                                      const VkDependencyInfo *pDependencyInfo)
-@@ -860,43 +773,6 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
+@@ -920,43 +833,6 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
     struct panvk_cs_deps deps = {0};
  
@@ -159,16 +159,16 @@ index a0e86412..21c2bcb4 100644
     panvk_per_arch(add_cs_deps)(cmdbuf, pDependencyInfo, &deps, false);
  
     if (deps.needs_fb_barrier)
-@@ -916,7 +792,6 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
-    panvk_per_arch(emit_barrier)(cmdbuf, deps);
- 
+@@ -978,7 +854,6 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
     STACK_ARRAY_FINISH(crc_addrs);
+ 
+    panvk_per_arch(cmd_bc_decode_zero_initialized)(cmdbuf, pDependencyInfo);
 -   STACK_ARRAY_FINISH(narrowed);
  }
  
  static struct cs_buffer
 diff --git a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
-index 4d344eb3..7eac0cf3 100644
+index 18ee0eea..7a16c701 100644
 --- a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
 +++ b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
 @@ -18,11 +18,6 @@
@@ -215,7 +215,7 @@ index 4d344eb3..7eac0cf3 100644
  static uint32_t
  kbase_resource_mask(enum panvk_subqueue_id subqueue)
  {
-@@ -2314,10 +2284,6 @@ panvk_queue_submit_init(struct panvk_queue_submit *submit,
+@@ -2340,10 +2310,6 @@ panvk_queue_submit_init(struct panvk_queue_submit *submit,
     submit->process_utrace =
        u_trace_should_process(&submit->dev->utrace.utctx) &&
        submit->phys_dev->kmod.dev->props.timestamp_frequency;
@@ -227,7 +227,7 @@ index 4d344eb3..7eac0cf3 100644
     submit->force_sync = PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC);
  }
 diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
-index 77e3a3ee..3b7e15e9 100644
+index dcacd09c..a9c1a05f 100644
 --- a/src/panfrost/vulkan/panvk_instance.c
 +++ b/src/panfrost/vulkan/panvk_instance.c
 @@ -17,10 +17,7 @@
@@ -241,7 +241,7 @@ index 77e3a3ee..3b7e15e9 100644
  #include <stdio.h>
  #include <unistd.h>
  #endif
-@@ -70,47 +67,9 @@ static const struct debug_control panvk_debug_options[] = {
+@@ -74,47 +71,9 @@ static const struct debug_control panvk_debug_options[] = {
  
  uint64_t panvk_debug;
  
