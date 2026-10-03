@@ -848,7 +848,7 @@ kbase_kcpu_poll_fence(int fd, int64_t timeout_ns)
 
 int
 kbase_kmod_csf_wait_cqs64(struct pan_kmod_dev *dev, uint64_t addr,
-                           uint64_t target_minus_one, int64_t timeout_ns)
+                          uint64_t target_minus_one, int64_t timeout_ns)
 {
    struct kbase_kmod_dev *kbase_dev =
       container_of(dev, struct kbase_kmod_dev, base);
@@ -1767,8 +1767,15 @@ kbase_kmod_bo_get_mmap_offset(struct pan_kmod_bo *bo)
 }
 
 /* Return the CPU mapping established at allocation time.  A SAME_VA region
- * has exactly one CPU mapping (its address is the GPU VA), so we cannot
- * honor requests for a caller-chosen address. */
+ * has exactly one CPU mapping and kbase's get_unmapped_area rejects both
+ * MAP_FIXED and mremap(MREMAP_FIXED) (measured on G615: EINVAL).  A
+ * caller-chosen address (VK_EXT_map_memory_placed, 32-bit WoW64 needs
+ * < 4 GiB) therefore only works for dma-buf backed BOs: the dma-buf is mapped
+ * a second time at that address, sharing pages with the GPU (no copy, no
+ * sync).  panvk allocates host-visible memory from the dma-heap when the app
+ * enables memoryMapPlaced (patch 091).
+ * ponytail: without /dev/dma_heap placed maps fail (ENOTSUP); an anonymous
+ * shadow copy needs dirty tracking to be both correct and fast. */
 static void *
 kbase_kmod_bo_mmap(struct pan_kmod_bo *bo, UNUSED int prot, UNUSED int flags,
                    void *host_addr)
@@ -1776,27 +1783,42 @@ kbase_kmod_bo_mmap(struct pan_kmod_bo *bo, UNUSED int prot, UNUSED int flags,
    struct kbase_kmod_bo *kbase_bo =
       container_of(bo, struct kbase_kmod_bo, base);
 
-   if (host_addr != NULL && host_addr != kbase_bo->cpu_ptr) {
-      mesa_loge("kbase: mapping a BO at a caller-chosen address is not "
-                "supported (SAME_VA)");
-      errno = ENOTSUP;
-      return MAP_FAILED;
-   }
-
    if (!kbase_bo->cpu_ptr) {
       errno = EINVAL;
       return MAP_FAILED;
    }
 
-   return kbase_bo->cpu_ptr;
+   if (host_addr == NULL || host_addr == kbase_bo->cpu_ptr)
+      return kbase_bo->cpu_ptr;
+
+   if (kbase_bo->dmabuf_fd < 0) {
+      mesa_loge("kbase: placed map of a non-dma-buf BO is not supported");
+      errno = ENOTSUP;
+      return MAP_FAILED;
+   }
+
+   /* MAP_FIXED is the VK_EXT_map_memory_placed contract: the range is the
+    * caller's (usually a PROT_NONE reservation). */
+   void *p = mmap(host_addr, bo->size, PROT_READ | PROT_WRITE,
+                  MAP_SHARED | MAP_FIXED, kbase_bo->dmabuf_fd, 0);
+   if (p == MAP_FAILED)
+      mesa_loge("kbase: placed dma-buf mmap at %p failed: %s", host_addr,
+                strerror(errno));
+   return p;
 }
 
-/* The mapping belongs to the BO and lives until bo_free: unmapping a
- * SAME_VA region would free its GPU mapping too. */
+/* Normally the mapping belongs to the BO and lives until bo_free: unmapping
+ * a SAME_VA region would free its GPU mapping too.  Only a placed dma-buf
+ * alias (any other address) is unmapped. */
 static int
-kbase_kmod_bo_munmap(UNUSED struct pan_kmod_bo *bo, UNUSED void *host_addr,
-                     UNUSED size_t size)
+kbase_kmod_bo_munmap(struct pan_kmod_bo *bo, void *host_addr, size_t size)
 {
+   struct kbase_kmod_bo *kbase_bo =
+      container_of(bo, struct kbase_kmod_bo, base);
+
+   if (host_addr && host_addr != kbase_bo->cpu_ptr &&
+       host_addr != kbase_bo->gpu_mapping)
+      return munmap(host_addr, size);
    return 0;
 }
 
@@ -1825,6 +1847,8 @@ kbase_kmod_flush_bo_map_syncs(struct pan_kmod_dev *dev)
       struct kbase_kmod_bo *kbase_bo =
          container_of(sync->bo, struct kbase_kmod_bo, base);
 
+      const bool flush = sync->type == PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH;
+
       /* System-coherent regions (dma-heap imports on DDKs that report
        * BASE_MEM_COHERENT_SYSTEM) need no MEM_SYNC; the ioctl rejects
        * them with EINVAL. */
@@ -1835,12 +1859,11 @@ kbase_kmod_flush_bo_map_syncs(struct pan_kmod_dev *dev)
          .handle = kbase_bo->gpu_va,
          .user_addr = (uintptr_t)kbase_bo->cpu_ptr + sync->start,
          .size = sync->size,
-         .type = sync->type == PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH
-                    ? BASE_SYNCSET_OP_MSYNC
-                    : BASE_SYNCSET_OP_CSYNC,
+         .type = flush ? BASE_SYNCSET_OP_MSYNC : BASE_SYNCSET_OP_CSYNC,
       };
 
-      if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_MEM_SYNC, &req)) {
+      int ret = pan_kmod_ioctl(dev->fd, KBASE_IOCTL_MEM_SYNC, &req);
+      if (ret) {
          mesa_loge("kbase: KBASE_IOCTL_MEM_SYNC failed: %s", strerror(errno));
          return -1;
       }

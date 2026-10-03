@@ -1,5 +1,53 @@
 # P23 Final DXVK/vkd3d compliance matrix
 
+## Beta.7 status (current)
+
+Release `g615-v11-csf-v0.1.0-beta.7`. Patches through `082`.
+
+Matrix rows below are evaluated from the beta.3-era consumer-capabilities.json capture; features listed here are device-proven in beta.7 but await a fresh capture. vertexPipelineStoresAndAtomics exposed on v10-v12 (078-082); swapchain lifecycle test done (passes on device); GS viewport index honoured (076).
+
+Exposed since the beta.3 capture:
+
+| Feature | Patch | CTS |
+|---|---|---|
+| `vertexPipelineStoresAndAtomics (v10-v12, via compute gpu_prerast; FL11_1 prerequisite)` | `078-082` | atomic_operations *_vertex* 66/0 (was NotSupported); tess/geometry/xfb.simple/draw list 7940/0, 0 DeviceLost; atomics/memory-model/shader-access/signal_order list 3775/0 |
+| `variableMultisampleRate` | `074` | variable_rate 504/0 standalone; combined regression 6210/0 |
+| `sync_fd export (kbase KCPU queue)` | `075` | 1996/0 (was 113 ResourceError) |
+| `multiViewport GS viewport index honoured` | `076` | draw scissor 88/88 |
+| `system-scope subqueue sync signals on kbase` | `077` | signal_order 1316/0 (0 timeouts) |
+| `swapchain lifecycle test` | `test-apk` | done (passes on device) |
+| `VK_EXT_memory_priority + VK_EXT_pageable_device_local_memory` | `069` | 224/0, 202/0; api.info 7799/0 |
+| `alphaToOne` | `070` | 123/0 |
+| `maxGeometryShaderInvocations` | `071` | geometry 193/0, instanced 20/0 |
+| `VK_EXT_multi_draw` | `072` | 12704/0 |
+| `VK_EXT_primitives_generated_query` | `073` | 75206/0 |
+| `geometryShader` | `before-beta.5` | geometry 193/0, instanced 20/0 |
+| `tessellationShader` | `before-beta.5` | 526/0 |
+| `VK_EXT_transform_feedback` | `before-beta.5` | 15793/0, 2 intermittent DeviceLost |
+| `textureCompressionBC` | `before-beta.5` | 1863/0, copy_and_blit 9620/0 |
+| `shaderClipDistance` | `before-beta.5` | device matrix 0 fail |
+| `shaderCullDistance` | `before-beta.5` | device matrix 0 fail |
+| `multiViewport` | `before-beta.5` | device matrix 0 fail |
+| `fillModeNonSolid` | `before-beta.5` | device matrix 0 fail |
+| `pipelineStatisticsQuery` | `049-054` | statistics_query 15374/0 |
+
+Open items:
+
+- GS primitive drop
+- DXVK FL11_1 not yet re-checked on the beta.7 build
+- render desc ringbuf / VkEvent syncobjs not in CSF event memory on kbase (possible eviction hang)
+- JICA98 0005 (same-queue semaphore waits) review
+- depthBounds
+- shaderOutputViewportIndex (not exposed; GS viewport index honoured in 076)
+- XFB intermittent DeviceLost
+- XFB 65536-record cap per non-tess draw
+- robustImageAccess2 (vkd3d-proton device-create blocker)
+
+Deferred:
+
+- vkd3d/D3D12
+- FL12 (sparse NO-GO on kbase)
+
 ## Result
 
 `FAIL`
