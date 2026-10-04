@@ -1,27 +1,53 @@
-# PanVK Kbase Android Driver
+<h1 align="center">PanVK Kbase Android Driver</h1>
+
+<p align="center">
+  Open Mesa <b>PanVK</b> Vulkan driver for Android Mali GPUs, talking directly to the vendor <code>mali_kbase</code> kernel driver.
+</p>
+
+<p align="center">
+  <a href="https://t.me/+E-NhUATmkqE5ODg1"><img src="https://img.shields.io/badge/Telegram-Join%20testers-26A5E4?style=for-the-badge&logo=telegram&logoColor=white" alt="Join the Telegram testers group"></a>
+  <a href="https://github.com/zenithblue-oss/panvk-kbase-android/releases/tag/g615-v11-csf-v0.1.0-beta.13"><img src="https://img.shields.io/badge/driver-beta.13-orange?style=for-the-badge" alt="Driver beta.13"></a>
+  <a href="https://github.com/zenithblue-oss/panvk-kbase-android/releases/tag/panplay-v1.0.3"><img src="https://img.shields.io/badge/PanPlay-1.0.3-blue?style=for-the-badge&logo=android&logoColor=white" alt="PanPlay 1.0.3"></a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Vulkan-1.4-AC162C?logo=vulkan&logoColor=white" alt="Vulkan 1.4">
+  <img src="https://img.shields.io/badge/GPU-Mali--G615%20(v11)-0091BD?logo=arm&logoColor=white" alt="Mali-G615 v11">
+  <img src="https://img.shields.io/badge/DXVK-D3D9%20%7C%2010%20%7C%2011-555" alt="DXVK D3D9, D3D10, D3D11">
+  <img src="https://img.shields.io/badge/Mesa-26.3--devel-6E4C9A" alt="Mesa 26.3-devel">
+</p>
+
+> [!IMPORTANT]
+> **🧪 Testers wanted!**
+>
+> 1. Install [PanPlay](https://github.com/zenithblue-oss/panvk-kbase-android/releases/tag/panplay-v1.0.3) and play your games.
+> 2. After **every** run, whether the game crashed or not, open the session logs screen and tap **Share as ZIP**.
+> 3. Send the ZIP to the **[Telegram testers group](https://t.me/+E-NhUATmkqE5ODg1)**, with the game name, your GPU, the FPS you saw and any glitches.
 
 <p align="center">
   <img src="apps/panvk-launcher/tests/results/samevaresults/cube/x86_64-d3d11-cube-hud.png" alt="Direct3D 11 cube demo running through DXVK on PanVK (Mali-G615)" width="100%">
 </p>
 
-Standalone patch/build layer around pinned upstream Mesa that produces an
-open Mesa PanVK driver talking directly to Android's proprietary
+## About
+
+A standalone patch and build layer around pinned upstream Mesa. It produces an
+open Mesa PanVK driver that talks directly to Android's proprietary
 `mali_kbase` kernel interface (`/dev/mali0`).
 
-Repository: [`zenithblue-oss/panvk-kbase-android`](https://github.com/zenithblue-oss/panvk-kbase-android)
+It is **not** a Samba-specific or Winlator-specific fork: one driver
+source/patch stack, with adapter packages around it.
 
-Primary consumers:
+**Primary consumers**
 
-1. **Samba S3** — Android/Bionic, in-process custom Vulkan driver
-2. **Bachata S4** — ARM64 glibc Vulkan ICD inside the managed runtime
-3. **NativeCode AI** — ARM64 glibc PRoot validation/development
+| # | Consumer | Integration |
+|---|---|---|
+| 1 | **Samba S3** | Android/Bionic, in-process custom Vulkan driver |
+| 2 | **Bachata S4** | ARM64 glibc Vulkan ICD inside the managed runtime |
+| 3 | **NativeCode AI** | ARM64 glibc PRoot validation and development |
 
-Secondary (only after primary driver is correct): Winlator /
-AdrenoTools-style loaders, GameHub / component injectors, other Android apps
-capable of loading an alternate Vulkan ICD.
-
-This is NOT a Samba-specific or Winlator-specific fork. One driver
-source/patch stack, adapter packages around it.
+**Secondary** (only once the primary driver is correct): Winlator or
+AdrenoTools-style loaders, GameHub or component injectors, and other Android
+apps that can load an alternate Vulkan ICD.
 
 ## Apps
 
@@ -30,15 +56,17 @@ source/patch stack, adapter packages around it.
 | <img src="apps/panvk-launcher/docs/panplay-logo-512.png" width="48" alt="PanPlay logo"> | **PanPlay** (`apps/panvk-launcher`) | Windows game launcher (Wine + DXVK + built-in X server) with the PanVK driver bundled | [PanPlay releases](https://github.com/zenithblue-oss/panvk-kbase-android/releases?q=panplay&expanded=true) |
 | <img src="apps/panvk-test/docs/panprobe-logo-512.png" width="48" alt="PanProbe logo"> | **PanProbe** (`apps/panvk-test`) | Vulkan feature/extension info and on-device driver tests | [PanProbe releases](https://github.com/zenithblue-oss/panvk-kbase-android/releases?q=panprobe&expanded=true) |
 
-Both apps support Mali-G615 only. See [apps/panvk-launcher/docs](apps/panvk-launcher/docs) for launcher usage.
+Both apps are tested on the Mali-G615 only. See [apps/panvk-launcher/docs](apps/panvk-launcher/docs) for launcher usage.
 
 ## Reference device
 
-- Phone: Poco X6 Pro (2311DRK48I, `duchamp`)
-- SoC: MediaTek Dimensity 8300-Ultra (MT6897)
-- GPU: Mali-G615 MC6, Pan arch v11, CSF frontend
-- Kernel interface: `/dev/mali0` (`mali_kbase`)
-- Observed GPU ID string: `Mali-G615 6 cores r1p3 0xB8A3`
+| | |
+|---|---|
+| **Phone** | Poco X6 Pro (2311DRK48I, `duchamp`) |
+| **SoC** | MediaTek Dimensity 8300-Ultra (MT6897) |
+| **GPU** | Mali-G615 MC6, Pan arch v11, CSF frontend |
+| **Kernel interface** | `/dev/mali0` (`mali_kbase`) |
+| **GPU ID string** | `Mali-G615 6 cores r1p3 0xB8A3` |
 
 ## Supported GPUs
 
@@ -54,6 +82,7 @@ upstream driver status are in
 
 Status key:
 - ✅ **Supported**: validated on a device.
+- 🔨 **Built, untested**: compiled into the universal ICD and recognised by the Mesa model table, but never run on that GPU.
 - 📋 **TODO**: a profile exists in `profiles/` and the port is planned.
 - ❔ **Possible, not tried**: Mesa has a backend for this arch, but no profile or device test exists here.
 - ❌ **Not possible**: no PanVK (Vulkan) backend exists for the arch.
@@ -69,11 +98,11 @@ One row per Mesa arch. Each GPU carries its own status mark.
 | v6 | Bifrost 1st/2nd gen | JM | ❌ Mali-G71, ❔ G72 | Mesa marks G71 unsupported; G72 experimental upstream |
 | v7 | Bifrost 1st to 3rd gen | JM | 📋 Mali-G52, ❔ G31, ❔ G51, ❔ G76 | Profile `g52-v7-jm` (P25); needs the JM kbase path |
 | v9 | Valhall 1st/2nd gen | JM | 📋 Mali-G57, ❔ G77, ❔ G68, ❔ G78, ❔ G78AE | Profile `g57-v9-jm` (P26); needs a v9 backend port and the JM kbase path |
-| v10 | Valhall 3rd gen | CSF | 📋 Mali-G610, ❔ G310, ❔ G510, ❔ G710 | Profile `g610-v10-csf` (P24) |
+| v10 | Valhall 3rd gen | CSF | 🔨 Mali-G610, 🔨 G310, ❔ G510, ❔ G710 | **Built, untested** (beta.13 universal ICD). G610/G310 are in the Mesa model table; G510/G710 need a tester's gpu_id |
 | **v11** | **Valhall 4th gen** | **CSF** | ✅ **Mali-G615**, ❔ G715, ❔ Immortalis-G715 | G615 validated on Poco X6 Pro (Dimensity 8300). G715 and Immortalis-G715 share the same arch but are untested |
-| v12 | 5th Gen | CSF | 📋 Mali-G720, ❔ G620, ❔ Immortalis-G720 | Profile `g720-v12-csf` (P24) |
-| v13 | 5th Gen | CSF | ❔ Mali-G625, ❔ G725, ❔ Immortalis-G925 | No profile yet |
-| v14 | 5th Gen, G1 series | CSF | ❔ Mali G1-Pro, ❔ G1-Premium, ❔ G1-Ultra | Experimental upstream; no profile yet |
+| v12 | 5th Gen | CSF | 🔨 Mali-G720, ❔ G620, ❔ Immortalis-G720 | **Built, untested** (beta.13 universal ICD). G720 (variant 4) is in the Mesa model table; G620/Immortalis-G720 need a tester's gpu_id |
+| v13 | 5th Gen | CSF | 🔨 Mali-G725, ❔ G625, ❔ Immortalis-G925 | **Built, untested** (beta.13 universal ICD). G725 (variant 4) is in the Mesa model table; G625/Immortalis-G925 need a tester's gpu_id |
+| v14 | 5th Gen, G1 series | CSF | 🔨 Mali G1-Ultra, 🔨 G1-Premium, 🔨 G1-Pro | **Built, untested** (beta.13 universal ICD). All three are in the Mesa model table; experimental upstream |
 | v15 (unconfirmed) | G2 series | CSF | ❌ Mali G2-Ultra NX, ❌ G2-Premium NX (rumoured), ❌ G2-Pro NX (rumoured) | Not in Mesa yet |
 
 "Possible" means Mesa has code for the arch. It does not mean the arch works
@@ -119,29 +148,19 @@ change creates a new release even if the Mesa SHA is unchanged.
 
 ### Current status
 
-`g615-v11-csf-v0.1.0-beta.11` is the latest published tag (prerelease, Mesa
-`5a07217f` plus the committed csf-v11 series up to 098). It fixes the
-`VK_ERROR_DEVICE_LOST` on tiler heap OOM (098) and the memory blow-up from
-per-pool TLS and eagerly committed prerast arenas (097). Need for Speed Most
-Wanted stays at about 2.0 GB RSS and runs races at 40-44 fps with FEX Extreme.
-The bundled driver in PanPlay 1.0.3 is beta.11. See the
-[release page](https://github.com/zenithblue-oss/panvk-kbase-android/releases/tag/g615-v11-csf-v0.1.0-beta.11).
-beta.10 (up to 096) made 32-bit
-WoW64 games fast and correct. Placed maps now map the BO's dma-buf again at
-the requested address (091) instead of a shadow copy. Need for Speed Most
-Wanted (DXVK D3D9) went from 0.5 fps to 39-66 fps, with clean HUD and text.
-It also adds GPU chunking of large and indirect prerast draws (094, 096),
-the tessellation conditional-state fix (093), and the sample count for
-attachment-less secondaries (095). Assets: Android and glibc drivers, `.adpkg` package, EMULATOR zip,
-the test APK and screenshots. See [`CHANGELOG.md`](CHANGELOG.md) and the
-[release page](https://github.com/zenithblue-oss/panvk-kbase-android/releases/tag/g615-v11-csf-v0.1.0-beta.10).
-beta.9 added `depthBounds` (092), `shaderOutputViewportIndex` from VS/TES
-(090), per-viewport depth clamp/clip (089) and CSF event-memory sync words
-(085).
-beta.8 added X11 surfaces (`VK_KHR_xlib_surface`, `VK_KHR_xcb_surface`) for
-Wine/Proton launchers that display through Termux:X11; the X11/XCB libraries
-are loaded at runtime from the launcher's library path and are not bundled.
-Presentation is a software copy (X11 `PutImage`).
+Latest: **[`g615-v11-csf-v0.1.0-beta.13`](https://github.com/zenithblue-oss/panvk-kbase-android/releases/tag/g615-v11-csf-v0.1.0-beta.13)**
+(prerelease, Mesa `5a07217f` plus the committed series up to 100). Each
+release ships the Android and glibc drivers, an `.adpkg` package, an EMULATOR
+zip, the test APK and screenshots. Full history: [`CHANGELOG.md`](CHANGELOG.md).
+
+| Release | Highlights |
+|---|---|
+| **beta.13** | One universal Android ICD for v10-v14. **Only v11 (G615) is tested; v10/v12/v13/v14 are built but untested, and testers are needed.** The kbase path now admits v14 without `PAN_I_WANT_A_BROKEN_VULKAN_DRIVER`; v13 was already admitted. Fixes PanProbe `gs_viewport_depth` case A, which regressed in beta.11 (100). On kbase, `gpu_prerast` arenas are committed up front again. GPU-fault growth lost the first GS draw. The shared-TLS memory fix from 097 stays. The kbase CS register-count fallback is now 128 on v12+; 96 was too small. `driverInfo` now reads `PanVK-kbase beta.13 (Mesa 26.3.0-devel ...)`, shown in the DXVK HUD and PanProbe. |
+| **beta.12** | One universal Android ICD for v10, v11 and v12. **Only v11 (G615) is tested; v10 and v12 are built but untested, and testers are needed.** The release notes give the command that reports your GPU ID. |
+| **beta.11** | Fixes `VK_ERROR_DEVICE_LOST` on tiler heap OOM (098). Fixes the memory blow-up from per-pool TLS and eagerly committed prerast arenas (097). |
+| **beta.10** | Fast and correct 32-bit WoW64 games: placed maps now map the BO's dma-buf again at the requested address (091) instead of a shadow copy. Need for Speed Most Wanted (DXVK D3D9) went from 0.5 fps to 39-66 fps, with clean HUD and text. Also GPU chunking of large and indirect prerast draws (094, 096), the tessellation conditional-state fix (093), and the sample count for attachment-less secondaries (095). |
+| **beta.9** | `depthBounds` (092), `shaderOutputViewportIndex` from VS/TES (090), per-viewport depth clamp/clip (089), CSF event-memory sync words (085). |
+| **beta.8** | X11 surfaces (`VK_KHR_xlib_surface`, `VK_KHR_xcb_surface`) for Wine/Proton launchers that display through Termux:X11. The X11/XCB libraries load at runtime from the launcher's library path and are not bundled. Presentation is a software copy (X11 `PutImage`). |
 
 `g615-v11-csf-v0.1.0-beta.3` (code commit
 `fc8a759e7d1b2b8de01c0e96f1fdc5e3950ba1a3`, published 2026-09-19) and its
