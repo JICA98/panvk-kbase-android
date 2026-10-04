@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: jica98 <jica.etzc@gmail.com>
 Date: Wed, 30 Sep 2026 02:40:53 +0530
-Subject: [PATCH 4/6] vulkan/wsi: faster software presentation for X11
+Subject: [PATCH 4/7] vulkan/wsi: faster software presentation for X11
 
 Prefer a host-cached memory type for the CPU-side present image even when
 it is not host-coherent, invalidating the mapping before the present

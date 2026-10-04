@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: jica98 <jica.etzc@gmail.com>
 Date: Wed, 30 Sep 2026 02:40:53 +0530
-Subject: [PATCH 5/6] panvk/kbase: resolve same-queue semaphore waits on the
+Subject: [PATCH 5/7] panvk/kbase: resolve same-queue semaphore waits on the
  GPU by default
 
 Upstream now implements GPU-side semaphore waits behind

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: jica98 <zenithblue.dev@gmail.com>
 Date: Sat, 3 Oct 2026 23:18:33 +0530
-Subject: [PATCH 1/6] bachata: composite delta over upstream (JM v9, CRC
+Subject: [PATCH 1/7] bachata: composite delta over upstream (JM v9, CRC
  mapping, kbase, compiler, always-on robust SSBO vectorization)
 
 ---
@@ -816,7 +816,7 @@ index 5c961e98..c5db93c7 100644
     if (nir->info.stage == MESA_SHADER_FRAGMENT) {
        NIR_PASS(_, nir, nir_lower_is_helper_invocation);
 diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
-index 76c64fbd..4a0fcbe1 100644
+index 68aed391..9a145287 100644
 --- a/src/panfrost/lib/kmod/kbase_kmod.c
 +++ b/src/panfrost/lib/kmod/kbase_kmod.c
 @@ -514,6 +514,17 @@ kbase_kmod_get_flush_id(const struct pan_kmod_dev *dev)
@@ -2748,7 +2748,7 @@ index 3052c0c0..23985a1c 100644
           ret = panvk_arch_name(name, v10)(__VA_ARGS__);                        \
           break;                                                                \
 diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
-index a7850747..054a32b6 100644
+index 7465627f..8d5c9e4e 100644
 --- a/src/panfrost/vulkan/panvk_physical_device.c
 +++ b/src/panfrost/vulkan/panvk_physical_device.c
 @@ -77,6 +77,7 @@
@@ -2788,9 +2788,9 @@ index a7850747..054a32b6 100644
     case 6:
     case 7:
 +   case 9:
-    case 14:
        if (!os_get_option("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER")) {
           result = panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
+                                "WARNING: panvk is not well-tested on v%d, "
 diff --git a/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c b/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c
 index 7f10154d..4e1b5c6e 100644
 --- a/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c
@@ -2807,7 +2807,7 @@ index 7f10154d..4e1b5c6e 100644
        cfg.flags_2.no_shader_depth_read =
           !(locations_read & BITFIELD_BIT(FRAG_RESULT_DEPTH));
 diff --git a/src/panfrost/vulkan/panvk_vX_device.c b/src/panfrost/vulkan/panvk_vX_device.c
-index 6fd68e51..59c1eaf2 100644
+index 17b39878..0b49577a 100644
 --- a/src/panfrost/vulkan/panvk_vX_device.c
 +++ b/src/panfrost/vulkan/panvk_vX_device.c
 @@ -43,6 +43,7 @@
